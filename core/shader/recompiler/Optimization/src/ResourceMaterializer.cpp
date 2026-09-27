@@ -25,7 +25,21 @@ struct DecodedImage {
     std::uint32_t shaderSwizzle = ShaderImageIdentitySwizzle;
     bool cube = false;
     bool fmask = false;
+    bool aluDepthCompare = false;
 };
+
+// Guest depth textures are sampled on the host as color (R16/R32), which cannot use Vulkan
+// depth-comparison sampling. Such images emulate IMAGE_SAMPLE_C with a color sample plus an
+// ALU compare; see ImageResource::aluDepthCompare and the SPIR-V image emitter.
+bool guestFormatUsesAluDepthCompare(IrBufferFormat format) {
+    switch (format) {
+        case IrBufferFormat::Format16UNorm:
+        case IrBufferFormat::Format32Float:
+            return true;
+        default:
+            return false;
+    }
+}
 
 ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
     if (value.dwordCount != 4u) {
@@ -110,7 +124,7 @@ std::uint32_t storageMipCount(const ImageResource& base, const DescriptorValue& 
 }
 
 bool sameImageShape(const ResourceSpecialization::Image& left, const ResourceSpecialization::Image& right) {
-    return left.numericClass == right.numericClass && left.dimension == right.dimension && left.mipCount == right.mipCount && left.conversionFormat == right.conversionFormat && left.shaderSwizzle == right.shaderSwizzle && left.cube == right.cube && left.fmask == right.fmask;
+    return left.numericClass == right.numericClass && left.dimension == right.dimension && left.mipCount == right.mipCount && left.conversionFormat == right.conversionFormat && left.shaderSwizzle == right.shaderSwizzle && left.cube == right.cube && left.fmask == right.fmask && left.aluDepthCompare == right.aluDepthCompare;
 }
 
 DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base) {
@@ -123,6 +137,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
         decoded.numericClass = base.atomic ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
         decoded.dimension = RdnaImageDimension::Dim2D;
         decoded.cube = false;
+        decoded.aluDepthCompare = false;
         return decoded;
     }
     if (base.resourceClass == ImageResourceClass::None || (base.atomic && base.resourceClass != ImageResourceClass::Storage)) {
@@ -134,6 +149,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     decoded.dimension = descriptorDimension(descriptor, base.dimension);
     decoded.cube = descriptorIsCube(descriptor);
     const auto format = rawImageFormat(descriptor);
+    decoded.aluDepthCompare = base.depthCompare && guestFormatUsesAluDepthCompare(format);
     if (base.atomic && format != IrBufferFormat::Format32UInt) {
         throw std::runtime_error("atomic image descriptor uses an unsupported format");
     }
@@ -305,6 +321,18 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
     }
 
     result.images.reserve(plan.info.images.size());
+    result.samplers.clear();
+    result.samplers.reserve(plan.info.samplers.size());
+    for (std::uint32_t i = 0; i < plan.info.samplers.size(); i++) {
+        // Bit 15 of the first dword forces unnormalized coordinates.
+        const bool unnormalized =
+            i < snapshot.samplers.size() && snapshot.samplers[i].dwordCount > 0u &&
+            ((snapshot.samplers[i].dwords[0] >> 15u) & 1u) != 0u;
+        ResourceSpecialization::Sampler samplerEntry;
+        samplerEntry.unnormalized = unnormalized;
+        result.samplers.push_back(samplerEntry);
+    }
+
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
         const DecodedImage decoded = decodeImageDescriptor(snapshot.images[i], image);
@@ -322,6 +350,7 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         entry.indirectSearchIterations = 0u;
         entry.cube = decoded.cube;
         entry.fmask = decoded.fmask;
+        entry.aluDepthCompare = decoded.aluDepthCompare;
         result.images.push_back(entry);
     }
 
@@ -346,6 +375,7 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
             entry.indirectSearchIterations = 0u;
             entry.cube = decodedCandidate.cube;
             entry.fmask = decodedCandidate.fmask;
+            entry.aluDepthCompare = decodedCandidate.aluDepthCompare;
             std::uint32_t targetIndex = NoRemap;
             for (std::uint32_t search = i; search < result.images.size(); search++) {
                 if (sameImageShape(result.images[search], entry)) {
@@ -416,6 +446,7 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         image.indirectMappingOffset = source.indirectMappingOffset;
         image.indirectSearchIterations = source.indirectSearchIterations;
         image.cube = source.cube;
+        image.aluDepthCompare = source.aluDepthCompare;
         image.indirectResources.clear();
     }
     for (std::uint32_t index = 0; index < images.size(); index++) {
@@ -453,6 +484,9 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
     }
     auto samplers = resources.info.samplers;
     auto sampledPairs = resources.info.sampledPairs;
+    for (std::size_t index = 0; index < samplers.size() && index < specialization.samplers.size(); index++) {
+        samplers[index].unnormalized = specialization.samplers[index].unnormalized;
+    }
     samplers.reserve(samplerCount);
     for (std::uint32_t index = 0; index < resources.info.samplers.size(); index++) {
         const auto target = pointSampler[index];
@@ -655,11 +689,11 @@ bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {
 }
 
 bool ResourceSpecialization::Image::operator==(const Image& other) const {
-    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask;
+    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && aluDepthCompare == other.aluDepthCompare;
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {
-    return buffers == other.buffers && images == other.images;
+    return buffers == other.buffers && images == other.images && samplers == other.samplers;
 }
 
 }

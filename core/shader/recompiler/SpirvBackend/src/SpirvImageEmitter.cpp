@@ -72,6 +72,78 @@ std::uint32_t ZeroF32(SpirvEmitterState& state) {
     return ConstantF32(state, 0);
 }
 
+// Guest sampler compare function from dword 0, when it is a compile-time constant. Defaults to
+// LessEqual; the runtime snapshot is not available during emission.
+std::uint32_t ResolvedSamplerCompareFunc(const SpirvEmitterState& state, const MemoryInfo& mem) {
+    if (mem.sampler < state.program.Info().samplers.size()) {
+        const auto& sampler = state.program.Info().samplers[mem.sampler];
+        if (sampler.source < state.program.Resources().descriptorSources.size()) {
+            const auto& source = state.program.Resources().descriptorSources[sampler.source];
+            if (source.dwordCount > 0u && source.dwords[0] != nullptr) {
+                const IrValue* dword0 = source.dwords[0]->Resolve();
+                if (dword0 != nullptr && dword0->HasImmediate() && dword0->Type() == IrType::U32) {
+                    return (dword0->ImmediateU32() >> 12u) & 0x7u;
+                }
+            }
+        }
+    }
+    return 0xffffffffu;
+}
+
+std::uint32_t SamplerCompareFunc(const SpirvEmitterState& state, const MemoryInfo& mem) {
+    const auto func = ResolvedSamplerCompareFunc(state, mem);
+    return func == 0xffffffffu ? 3u : func;
+}
+
+// GCN IMAGE_SAMPLE_C on a guest depth format is emulated with a plain color sample plus an ALU
+// compare: host sampled views are color formats (including depth sampled as R16/R32), which do
+// not support depth-comparison sampling, so Vulkan Dref ops are illegal there. Images whose
+// guest format is not depth-like take a regular color sample; bitmap fonts use SAMPLE_C with
+// non-comparison samplers and expect the texel, not 0/1 coverage.
+bool ImageUsesAluDepthCompare(const SpirvEmitterState& state, const MemoryInfo& mem) {
+    return mem.resource < state.program.Info().images.size() &&
+           state.program.Info().images[mem.resource].aluDepthCompare;
+}
+
+std::uint32_t EmitAluDepthCompareF32(SpirvEmitterState& state, std::uint32_t sampled, std::uint32_t dref,
+                                     std::uint32_t compareFunc) {
+    const auto one = ConstantF32Value(state, 1.0f);
+    const auto zero = ZeroF32(state);
+    switch (compareFunc) {
+        case 0:
+            return zero;
+        case 7:
+            return one;
+        default:
+            break;
+    }
+    auto opcode = spv::OpFOrdLessThanEqual;
+    switch (compareFunc) {
+        case 1:
+            opcode = spv::OpFOrdLessThan;
+            break;
+        case 2:
+            opcode = spv::OpFOrdEqual;
+            break;
+        case 3:
+            opcode = spv::OpFOrdLessThanEqual;
+            break;
+        case 4:
+            opcode = spv::OpFOrdGreaterThan;
+            break;
+        case 5:
+            opcode = spv::OpFOrdNotEqual;
+            break;
+        case 6:
+            opcode = spv::OpFOrdGreaterThanEqual;
+            break;
+        default:
+            break;
+    }
+    const auto pass = Binary(state, opcode, TypeBool(state), sampled, dref);
+    return Select(state, TypeF32(state), pass, one, zero);
+}
+
 std::uint32_t F32BitsToU32(SpirvValueEmitContext& ctx, std::uint32_t value) {
     return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), value);
 }
@@ -465,6 +537,48 @@ std::uint32_t EmitOneDimensionalGatherLz(SpirvValueEmitContext& ctx, const Image
     return result;
 }
 
+// Guest samplers can address texels directly. Vulkan's own unnormalized samplers forbid implicit
+// LOD, depth comparison and multi-level views, so the coordinates are normalized in the shader
+// instead and an ordinary sampler is used.
+std::uint32_t NormalizeTexelCoordinates(SpirvValueEmitContext& ctx, std::uint32_t resource,
+                                        RdnaImageDimension dimension, std::uint32_t coord) {
+    auto& state = ctx.state;
+    const auto& info = RdnaImageDimensionInfoFor(dimension);
+    if (info.multisampled != 0u) {
+        return coord;
+    }
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto image = LoadSampledImageDescriptor(state, resource);
+    const auto size = state.module.AllocateId();
+    state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size, image, ConstantU32(state, 0));
+
+    const std::uint32_t components = info.coordinateComponents;
+    std::vector<std::uint32_t> words{spv::OpCompositeConstruct, TypeF32Vector(state, components), state.module.AllocateId()};
+    for (std::uint32_t index = 0; index < components; index++) {
+        auto value = coord;
+        if (components > 1u) {
+            value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+        }
+        if (index < info.spatialComponents) {
+            auto extent = size;
+            if (components > 1u) {
+                extent = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, index);
+            }
+            const auto extentF32 = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToF, TypeF32(state), extentF32, extent);
+            value = Binary(state, spv::OpFDiv, TypeF32(state), value, extentF32);
+        }
+        words.push_back(value);
+    }
+    if (components == 1u) {
+        return words.back();
+    }
+    state.module.AddFunction(words);
+    return words[2];
+}
+
 std::uint32_t PackImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t texel) {
     auto& state = ctx.state;
     const auto info = ImageConversionFormat(access.image);
@@ -624,11 +738,40 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const auto& mem = access.mem;
     const auto dimension = access.image.dimension;
     if (dimension == RdnaImageDimension::Dim1D) {
-        if (setup.dref || !HasFlag(mem, RdnaImageSampleFlagLevelZero) || HasFlag(mem, RdnaImageSampleFlagOffset) || HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
+        // Reachability: IMAGE_GATHER4_C / GATHER_C_LZ[_O] on a 1D image (guest Color1D) with the
+        // Compare flag set. That requires a 1D depth texture sampled with depth comparison; with
+        // indirect it additionally requires a bindless heap (image.indirectRoot != resource)
+        // holding 1D depth candidates. 1D depth has no practical backing (shadow maps are 2D)
+        // and no known title uses it, so this path is effectively unreachable, but Dref is now
+        // emulated like the 2D path instead of failing. 1D-array gather stays unsupported.
+        if (!HasFlag(mem, RdnaImageSampleFlagLevelZero) || HasFlag(mem, RdnaImageSampleFlagOffset) || HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
             ctx.Fail(access.inst, "has an unsupported 1D gather variant");
         }
+        const bool aluCompare =
+            setup.dref && setup.numericClass == IrTextureNumericClass::Float &&
+            ImageUsesAluDepthCompare(state, mem);
         const auto sample = EmitOneDimensionalGatherLz(ctx, access, setup.coord);
-        ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, sample), setup.numericClass, false, true));
+        auto gathered = sample;
+        if (aluCompare) {
+            auto drefValue = ZeroF32(state);
+            if (setup.layout.dref != NoImageComponent && mem.imageAddressComponents > setup.layout.dref) {
+                drefValue = AddressF32(ctx, access, setup.layout.dref);
+            }
+            const auto compareFunc = SamplerCompareFunc(state, mem);
+            std::uint32_t lanes[4] = {};
+            for (std::uint32_t lane = 0; lane < 4u; lane++) {
+                const auto texel = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), texel, sample, lane);
+                lanes[lane] = EmitAluDepthCompareF32(state, texel, drefValue, compareFunc);
+            }
+            gathered = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), gathered, lanes[0], lanes[1], lanes[2], lanes[3]);
+        }
+        auto resultNumericClass = setup.numericClass;
+        if (setup.dref) {
+            resultNumericClass = IrTextureNumericClass::Float;
+        }
+        ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, gathered), resultNumericClass, false, true));
         return;
     }
     if (dimension == RdnaImageDimension::Dim1DArray) {
@@ -636,17 +779,14 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler);
     const auto sample = state.module.AllocateId();
-    std::vector<std::uint32_t> words;
-    if (setup.dref) {
-        const auto drefValue = DrefValueF32(ctx, access, setup.layout);
-        words = {spv::OpImageDrefGather, TypeF32Vector(state, 4), sample, sampled, setup.coord, drefValue};
-    } else {
-        std::uint32_t component = 0;
-        if (ImageConversionFormat(access.image).format == IrBufferFormat::Invalid) {
-            component = ImageGatherComponent(EffectiveDmask(mem));
-        }
-        words = {spv::OpImageGather, ImageVectorType(state, setup.numericClass, 4), sample, sampled, setup.coord, ConstantU32(state, component)};
+    const bool aluCompare =
+        setup.dref && setup.numericClass == IrTextureNumericClass::Float &&
+        ImageUsesAluDepthCompare(state, mem);
+    std::uint32_t component = 0;
+    if (!aluCompare && ImageConversionFormat(access.image).format == IrBufferFormat::Invalid) {
+        component = ImageGatherComponent(EffectiveDmask(mem));
     }
+    std::vector<std::uint32_t> words = {spv::OpImageGather, ImageVectorType(state, setup.numericClass, 4), sample, sampled, setup.coord, ConstantU32(state, component)};
     if (HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
         words.push_back(spv::ImageOperandsConstOffsetsMask);
         words.push_back(HorizontalOffsets(ctx, access));
@@ -655,11 +795,27 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         words.push_back(PackedOffset(ctx, access, setup.layout));
     }
     state.module.AddFunction(words);
+    auto gathered = sample;
+    if (aluCompare) {
+        auto drefValue = ZeroF32(state);
+        if (setup.layout.dref != NoImageComponent && mem.imageAddressComponents > setup.layout.dref) {
+            drefValue = AddressF32(ctx, access, setup.layout.dref);
+        }
+        const auto compareFunc = SamplerCompareFunc(state, mem);
+        std::uint32_t lanes[4] = {};
+        for (std::uint32_t lane = 0; lane < 4u; lane++) {
+            const auto texel = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), texel, sample, lane);
+            lanes[lane] = EmitAluDepthCompareF32(state, texel, drefValue, compareFunc);
+        }
+        gathered = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), gathered, lanes[0], lanes[1], lanes[2], lanes[3]);
+    }
     auto resultNumericClass = setup.numericClass;
     if (setup.dref) {
         resultNumericClass = IrTextureNumericClass::Float;
     }
-    ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, sample), resultNumericClass, false, true));
+    ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, gathered), resultNumericClass, false, true));
 }
 
 std::uint32_t EmitIndirectImageSelector(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t key) {
@@ -699,39 +855,65 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     auto& state = ctx.state;
     const auto& mem = access.mem;
     const auto& image = access.image;
-    const bool explicitLod = HasFlag(mem, RdnaImageSampleFlagDerivative) || HasFlag(mem, RdnaImageSampleFlagLod) || HasFlag(mem, RdnaImageSampleFlagLevelZero) || state.program.Resources().stage != IrShaderStage::Pixel;
+    // Unnormalized samplers have no mip selection, so they sample level zero explicitly.
+    const bool unnormalized = mem.sampler < state.program.Info().samplers.size() &&
+                              state.program.Info().samplers[mem.sampler].unnormalized;
+    const bool explicitLod = unnormalized || HasFlag(mem, RdnaImageSampleFlagDerivative) || HasFlag(mem, RdnaImageSampleFlagLod) || HasFlag(mem, RdnaImageSampleFlagLevelZero) || state.program.Resources().stage != IrShaderStage::Pixel;
     std::uint32_t opcode = spv::OpImageSampleImplicitLod;
     if (explicitLod) {
-        opcode = setup.dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
-    } else if (setup.dref) {
-        opcode = spv::OpImageSampleDrefImplicitLod;
+        opcode = spv::OpImageSampleExplicitLod;
     }
-    std::uint32_t resultType = ImageVectorType(state, setup.numericClass, 4);
+    const std::uint32_t resultType = ImageVectorType(state, setup.numericClass, 4);
+    const bool aluCompare =
+        setup.dref && setup.numericClass == IrTextureNumericClass::Float &&
+        ImageUsesAluDepthCompare(state, mem);
     std::uint32_t drefValue = 0;
-    if (setup.dref) {
-        resultType = TypeF32(state);
-        drefValue = DrefValueF32(ctx, access, setup.layout);
+    if (aluCompare) {
+        drefValue = ZeroF32(state);
+        if (setup.layout.dref != NoImageComponent && mem.imageAddressComponents > setup.layout.dref) {
+            drefValue = AddressF32(ctx, access, setup.layout.dref);
+        }
     }
+    const auto compareFunc = aluCompare ? SamplerCompareFunc(state, mem) : 0u;
     std::uint32_t operandMask = 0;
     std::vector<std::uint32_t> operands;
-    if (HasFlag(mem, RdnaImageSampleFlagDerivative)) {
+    if (HasFlag(mem, RdnaImageSampleFlagDerivative) && !unnormalized) {
         operandMask |= spv::ImageOperandsGradMask;
         operands.push_back(CoordF32(ctx, access, setup.layout.gradX, setup.dimensionInfo.spatialComponents));
         operands.push_back(CoordF32(ctx, access, setup.layout.gradY, setup.dimensionInfo.spatialComponents));
     } else if (explicitLod) {
         operandMask |= spv::ImageOperandsLodMask;
-        operands.push_back(HasFlag(mem, RdnaImageSampleFlagLod) ? AddressF32(ctx, access, setup.layout.lod) : ZeroF32(state));
+        auto lod = ZeroF32(state);
+        if (!unnormalized && HasFlag(mem, RdnaImageSampleFlagLod) && setup.layout.lod != NoImageComponent) {
+            lod = AddressF32(ctx, access, setup.layout.lod);
+        }
+        operands.push_back(lod);
     } else if (setup.layout.bias != NoImageComponent) {
         operandMask |= spv::ImageOperandsBiasMask;
         operands.push_back(AddressF32(ctx, access, setup.layout.bias));
     }
     const auto emitSample = [&](std::uint32_t resource) {
+        auto coord = setup.coord;
+        // Recompute per-candidate so unnormalized normalization uses the candidate shape.
+        // Cube coords are direction vectors (CubeAxis/CubeLayer), not texel UV, so texel-size
+        // normalization does not apply (skipped below via !candidate.cube). Mixed cube/non-cube
+        // candidates for one shader would be a descriptor-type mismatch and does not occur in
+        // valid bindless heaps; keeping the precomputed (base-cube) coord in that unreachable
+        // case preserves the existing cube path instead of emitting mismatched CubeAxis logic.
+        const auto& candidate = state.program.Info().images.at(resource);
+        if (candidate.cube == access.image.cube) {
+            const auto candidateComponents = RdnaImageDimensionInfoFor(candidate.dimension).coordinateComponents;
+            const auto baseComponents = RdnaImageDimensionInfoFor(access.image.dimension).coordinateComponents;
+            if (candidateComponents != baseComponents || unnormalized) {
+                coord = CoordF32(ctx, access, setup.layout.coord, candidateComponents);
+            }
+        }
+        if (unnormalized && !candidate.cube) {
+            coord = NormalizeTexelCoordinates(ctx, resource, candidate.dimension, coord);
+        }
         const auto sampled = MakeSampledImage(state, resource, mem.sampler);
         const auto sample = state.module.AllocateId();
-        std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, setup.coord};
-        if (setup.dref) {
-            words.push_back(drefValue);
-        }
+        std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, coord};
         if (operandMask != 0u) {
             words.push_back(operandMask);
             words.insert(words.end(), operands.begin(), operands.end());
@@ -739,10 +921,18 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         state.module.AddFunction(words);
         return sample;
     };
+    const auto applyAluDepthCompare = [&](std::uint32_t color) {
+        const auto red = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), red, UnpackImageTexel(ctx, access, color), 0u);
+        return EmitAluDepthCompareF32(state, red, drefValue, compareFunc);
+    };
     if (image.indirectRoot != mem.resource) {
         const auto sample = emitSample(mem.resource);
-        const auto result = setup.dref ? sample : UnpackImageTexel(ctx, access, sample);
-        ctx.Define(access.inst, ResultVector(ctx, access, result, setup.numericClass, setup.dref, false));
+        if (!aluCompare) {
+            ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageTexel(ctx, access, sample), setup.numericClass, false, false));
+            return;
+        }
+        ctx.Define(access.inst, ResultVector(ctx, access, applyAluDepthCompare(sample), setup.numericClass, true, false));
         return;
     }
     const auto* handle = access.inst.Argument(0);
@@ -779,11 +969,12 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     EmitLabel(state, mergeLabel);
     state.module.AddFunction(phiWords);
-    auto result = phiWords[2];
-    if (!setup.dref) {
-        result = UnpackImageTexel(ctx, access, result);
+    const auto color = phiWords[2];
+    if (!aluCompare) {
+        ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageTexel(ctx, access, color), setup.numericClass, false, false));
+        return;
     }
-    ctx.Define(access.inst, ResultVector(ctx, access, result, setup.numericClass, setup.dref, false));
+    ctx.Define(access.inst, ResultVector(ctx, access, applyAluDepthCompare(color), setup.numericClass, true, false));
 }
 
 void EmitSamplingOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {

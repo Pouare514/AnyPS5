@@ -24,16 +24,25 @@ struct ResourceSpecialization {
         IrBufferFormat conversionFormat = IrBufferFormat::Invalid;
         std::uint32_t shaderSwizzle = ShaderImageIdentitySwizzle;
         std::uint32_t indirectRoot = ImageResource::NoIndirectImage;
-        std::uint32_t indirectMappingOffset = 0;
-        std::uint32_t indirectSearchIterations = 0;
+        std::uint32_t indirectMappingOffset = 0u;
+        std::uint32_t indirectSearchIterations = 0u;
         bool cube = false;
         bool fmask = false;
+        bool aluDepthCompare = false;
 
         bool operator==(const Image& other) const;
     };
 
+    struct Sampler {
+        // The descriptor addresses texels directly (force-unnormalized coordinates).
+        bool unnormalized = false;
+
+        bool operator==(const Sampler& other) const = default;
+    };
+
     std::vector<Buffer> buffers;
     std::vector<Image> images;
+    std::vector<Sampler> samplers;
 
     bool operator==(const ResourceSpecialization& other) const;
 

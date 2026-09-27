@@ -47,6 +47,7 @@ struct ImageResource {
     bool written = false;
     bool atomic = false;
     bool depthCompare = false;
+    bool aluDepthCompare = false;
     bool cube = false;
     bool r128 = false;
     std::uint32_t indirectRoot = NoIndirectImage;
@@ -62,6 +63,8 @@ struct SamplerResource {
     std::uint32_t firstUsePc = 0;
     bool forcePointFiltering = false;
     bool depthCompare = false;
+    // The guest sampler addresses texels directly. The shader normalizes the coordinates.
+    bool unnormalized = false;
 
     bool operator==(const SamplerResource& other) const = default;
 };

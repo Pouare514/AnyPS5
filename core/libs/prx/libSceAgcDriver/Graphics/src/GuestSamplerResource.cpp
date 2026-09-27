@@ -74,7 +74,9 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words)
 
     const auto borderColorType = (words[3] >> 30u) & 0x3u;
 
-    Require(!forceUnormCoords, "guest sampler descriptor uses unnormalized coordinates which are not implemented");
+    // Unnormalized coordinates are emulated in the shader (normalize via image size,
+    // explicit LOD 0, no Grad) with an ordinary normalized Vulkan sampler, since Vulkan's
+    // own unnormalized samplers forbid implicit LOD, depth comparison and multi-level views.
     Require(anisoThreshold == 0, "guest sampler descriptor uses an anisotropy threshold override which is not implemented");
     Require(!forceSrgb, "guest sampler descriptor forces sRGB decoding which is not implemented");
     Require(anisoBias == 0, "guest sampler descriptor uses an anisotropy bias which is not implemented");
@@ -125,6 +127,17 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words)
     result.minLod = minLod;
     result.maxLod = maxLod;
     result.lodBias = toSignedLodBias(lodBiasRaw);
+    result.borderColor = border;
+    if (forceUnormCoords) {
+        result.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        result.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        result.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        result.minLod = 0.0f;
+        result.maxLod = 0.0f;
+        result.anisotropyEnable = false;
+        result.maxAnisotropy = 1.0f;
+        result.lodBias = 0.0f;
+    }
     result.borderColor = border;
     const std::array compareOps{VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS};
     result.compareOp = compareOps.at(depthCompareFunc);

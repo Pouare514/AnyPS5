@@ -96,7 +96,14 @@ std::uint32_t ImageType(SpirvEmitterState& state, const ImageResource& image) {
         FailEmit("invalid image resource class");
     }
     const auto& info = RdnaImageDimensionInfoFor(image.dimension);
-    return state.module.Type(spv::OpTypeImage, ImageScalarType(state, image.numericClass), info.spirvDimension, image.depthCompare ? 1u : 0u, info.arrayed, info.multisampled, sampled, format);
+    // Host sampled views are always color (R8G8B8A8/R16/R32 with COLOR_BIT; see Texture.cpp) and
+    // SAMPLE_C is lowered to a plain OpImageSample/OpImageGather plus an ALU compare, so no Dref
+    // ops are emitted. A Depth==1 OpTypeImage would mismatch the color view (Vulkan validation
+    // error: sampled color view with Depth image type) and imply depth sampling. Keep Depth 0
+    // even when depthCompare is set, and in particular when aluDepthCompare is set; non-depth
+    // formats with depthCompare (bitmap fonts) also take the plain-sample path and need Depth 0.
+    constexpr std::uint32_t depth = 0u;
+    return state.module.Type(spv::OpTypeImage, ImageScalarType(state, image.numericClass), info.spirvDimension, depth, info.arrayed, info.multisampled, sampled, format);
 }
 
 std::uint32_t ImageViewSizeType(SpirvEmitterState& state, RdnaImageDimension dimension) {
