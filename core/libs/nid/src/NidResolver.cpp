@@ -4,10 +4,28 @@
 #include <nid/NidPatcherUtils.hpp>
 #include <cstdint>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace Nid {
+
+namespace {
+
+std::string CanonicalNidProvider(const std::string& library) {
+    if (library == "Agc" || library == "Agc_v1" || library == "Agc_v1.1" ||
+        library == "libSceAgc" || library == "libSceAgc.prx")
+        return "libSceAgc";
+    if (library == "AgcDriver" || library == "AgcDriver_v1" || library == "AgcDriver_v1.1" ||
+        library == "libSceAgcDriver" || library == "libSceAgcDriver.prx")
+        return "libSceAgcDriver";
+    if (library == "Ssl" || library == "Ssl_v1" || library == "Ssl_v1.1" ||
+        library == "Ssl_v2.1" || library == "libSceSsl" || library == "libSceSsl.prx")
+        return "libSceSsl";
+    return library;
+}
+
+}
 
 std::string ResolveOneName(const std::string& funcName) {
     using namespace Internal;
@@ -23,13 +41,15 @@ std::string ResolveOneName(const std::string& funcName) {
 std::unordered_map<std::string, std::string> ResolveNids(const std::vector<std::string>& exportedNames, const std::string& libraryName, const std::unordered_set<std::string>& excludedExports) {
     using namespace Internal;
 
+    const std::string canonicalLibrary = CanonicalNidProvider(libraryName);
+
     std::unordered_set<std::string> nameSet(exportedNames.begin(), exportedNames.end());
 
     if (nameSet.size() != exportedNames.size()) {
         for (std::size_t i = 0u; i < exportedNames.size(); ++i) {
             for (std::size_t j = i + 1u; j < exportedNames.size(); ++j) {
                 if (exportedNames[i] == exportedNames[j])
-                    throw std::runtime_error("duplicate exported symbol \"" + exportedNames[i] + "\" in library \"" + libraryName + "\"");
+                    throw std::runtime_error("duplicate exported symbol \"" + exportedNames[i] + "\" in library \"" + canonicalLibrary + "\"");
             }
         }
     }
@@ -59,7 +79,7 @@ std::unordered_map<std::string, std::string> ResolveNids(const std::vector<std::
             continue;
         }
 
-        result[name] = ComputeNid(stripped, libraryName);
+        result[name] = ComputeNid(stripped, canonicalLibrary);
     }
 
     return result;

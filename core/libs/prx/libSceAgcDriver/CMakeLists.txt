@@ -272,7 +272,18 @@ endif()
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)
 
 if(AGC_BUILD_VISUAL_TEST)
-    ensure_agc_glslang()
+ensure_agc_glslang()
+
+# Single-config Ninja with empty CMAKE_BUILD_TYPE expects Release-style
+# archive names (libSPIRV.a), but glslang forces Debug in its own scope and
+# sets CMAKE_DEBUG_POSTFIX=d on WIN32, producing libSPIRVd.a. The stale
+# order-only dep on libSPIRV.a then has no rule and breaks every `libs`
+# ninja build. Clear the postfix so outputs match the expected names.
+foreach(_agc_glslang_target IN ITEMS SPIRV glslang glslang-default-resource-limits OSDependent MachineIndependent GenericCodeGen)
+    if(TARGET ${_agc_glslang_target})
+        set_target_properties(${_agc_glslang_target} PROPERTIES DEBUG_POSTFIX "")
+    endif()
+endforeach()
 
     set(visualShaders)
 

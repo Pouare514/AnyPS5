@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+#include <unordered_map>
 
 namespace Relinker {
 
@@ -161,6 +162,106 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         if (policy) policy->RegisterLibraryImport(snd);
     }
 
+    // SCE import-lib module names (DT_SCE_IMPORT_LIB 0x61000049, low32 = str offset).
+    // Kept for diagnostics/fallback; the NID suffix lib index maps into neededLibraries.
+    std::vector<std::string> sceModuleNames;
+    for (const auto& tag : dynTags) {
+        if (tag.Tag == 0x61000049) {
+            const std::uint32_t modStrOff = static_cast<std::uint32_t>(tag.Value & 0xffffffffu);
+            sceModuleNames.push_back(readCStr(modStrOff));
+        }
+    }
+
+    // GNU versioning tables (DT_VERSYM/DT_VERNEED) when present (Linux/test ELFs).
+    // PS5 SCE eboots carry no GNU versioning; they encode lib/mod ids in the
+    // NID string suffix instead (see below).
+    static constexpr std::int64_t DT_VERSYM = 0x6ffffff0;
+    static constexpr std::int64_t DT_VERNEED = 0x6ffffffe;
+    static constexpr std::int64_t DT_VERNEEDNUM = 0x6fffffff;
+    static constexpr std::int64_t DT_HASH = 4;
+    static constexpr std::int64_t DT_OS_SYMTABSZ = 0x6100003f;
+    std::vector<std::uint16_t> gnuVersym;
+    std::unordered_map<std::uint16_t, std::string> gnuVersionToLibrary;
+    if (hasTag(DT_VERSYM) && hasTag(DT_VERNEED)) {
+        try {
+            std::uint64_t symCount = 0;
+            if (hasTag(DT_OS_SYMTABSZ)) {
+                const std::uint64_t symtabSz = getTagValue(DT_OS_SYMTABSZ);
+                if (symtabSz % symEntSize == 0)
+                    symCount = symtabSz / symEntSize;
+            } else if (hasTag(DT_HASH)) {
+                const FileByteOffset hashOff = _elfReader->TranslateVirtualAddress(getTagValue(DT_HASH));
+                if (hashOff + 8 <= raw.size()) {
+                    std::uint32_t nbucket = 0, nchain = 0;
+                    std::memcpy(&nbucket, raw.data() + hashOff, 4);
+                    std::memcpy(&nchain, raw.data() + hashOff + 4, 4);
+                    symCount = nchain;
+                }
+            }
+            const FileByteOffset versymOff = _elfReader->TranslateVirtualAddress(getTagValue(DT_VERSYM));
+            const FileByteOffset verneedOff = _elfReader->TranslateVirtualAddress(getTagValue(DT_VERNEED));
+            if (symCount > 0 && symCount < 0x1000000u &&
+                versymOff + symCount * 2 <= raw.size() && verneedOff < raw.size()) {
+                gnuVersym.resize(static_cast<std::size_t>(symCount));
+                for (std::uint64_t i = 0; i < symCount; ++i) {
+                    std::uint16_t v = 0;
+                    std::memcpy(&v, raw.data() + versymOff + i * 2, 2);
+                    gnuVersym[static_cast<std::size_t>(i)] = v;
+                }
+                // Walk Elf64_Verneed list: u16 version,cnt; u32 file,aux,next.
+                FileByteOffset vnOff = verneedOff;
+                for (int guard = 0; guard < 256; ++guard) {
+                    if (vnOff + 16 > raw.size())
+                        break;
+                    std::uint16_t vnVersion = 0, vnCnt = 0;
+                    std::uint32_t vnFile = 0, vnAux = 0, vnNext = 0;
+                    std::memcpy(&vnVersion, raw.data() + vnOff, 2);
+                    std::memcpy(&vnCnt, raw.data() + vnOff + 2, 2);
+                    std::memcpy(&vnFile, raw.data() + vnOff + 4, 4);
+                    std::memcpy(&vnAux, raw.data() + vnOff + 8, 4);
+                    std::memcpy(&vnNext, raw.data() + vnOff + 12, 4);
+                    if (vnVersion != 1)
+                        break;
+                    const std::string libFile = readCStr(vnFile);
+                    FileByteOffset auxOff = vnOff + vnAux;
+                    for (std::uint16_t a = 0; a < vnCnt; ++a) {
+                        if (auxOff + 16 > raw.size())
+                            break;
+                        std::uint32_t vnaHash = 0, vnaName = 0, vnaNext = 0;
+                        std::uint16_t vnaFlags = 0, vnaOther = 0;
+                        std::memcpy(&vnaHash, raw.data() + auxOff, 4);
+                        std::memcpy(&vnaFlags, raw.data() + auxOff + 4, 2);
+                        std::memcpy(&vnaOther, raw.data() + auxOff + 6, 2);
+                        std::memcpy(&vnaName, raw.data() + auxOff + 8, 4);
+                        std::memcpy(&vnaNext, raw.data() + auxOff + 12, 4);
+                        if (vnaOther != 0 && gnuVersionToLibrary.find(vnaOther) == gnuVersionToLibrary.end()) {
+                            const std::string verName = readCStr(vnaName);
+                            gnuVersionToLibrary[vnaOther] = verName.empty() ? libFile : verName;
+                        }
+                        if (vnaNext == 0)
+                            break;
+                        auxOff += vnaNext;
+                    }
+                    if (vnNext == 0)
+                        break;
+                    vnOff += vnNext;
+                }
+            }
+        } catch (const RelinkerException&) {
+            gnuVersym.clear();
+            gnuVersionToLibrary.clear();
+        }
+    }
+
+    auto decodeSceId = [](char c) -> int {
+        static constexpr char kCharset[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+        for (int i = 0; kCharset[i] != '\0'; ++i)
+            if (kCharset[i] == c)
+                return i;
+        return -1;
+    };
+
     auto extractRela = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
         for (ByteCount off = 0; off + relaEntSize <= relaSize; off += relaEntSize) {
             const FileByteOffset pos = relaOff + off;
@@ -189,7 +290,42 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             std::uint32_t nameOff = 0;
             std::memcpy(&nameOff, raw.data() + symOff, 4);
 
-            nidRefs.push_back({readCStr(nameOff), {}, relType, pos, rOffset, rAddend});
+            const std::string nidStr = readCStr(nameOff);
+            std::string nidLibrary;
+            // SCE NIDs carry "#lib#mod" suffix (16-byte entries, e.g. "P330P3dFF68#T#T").
+            // The lib id indexes the SCE module table (DT_SCE_IMPORT_LIB order,
+            // 0-based) which also covers module-only imports like libScePosix that
+            // have no DT_NEEDED filename. Prefer it; fall back to DT_NEEDED.
+            const std::size_t hash1 = nidStr.find('#');
+            if (hash1 != std::string::npos) {
+                const std::size_t hash2 = nidStr.find('#', hash1 + 1);
+                if (hash2 != std::string::npos && hash2 + 1 < nidStr.size() &&
+                    hash1 + 1 < hash2) {
+                    const int libIdx = decodeSceId(nidStr[hash1 + 1]);
+                    if (libIdx >= 0 &&
+                        static_cast<std::size_t>(libIdx) < sceModuleNames.size()) {
+                        nidLibrary = sceModuleNames[static_cast<std::size_t>(libIdx)];
+                    } else if (libIdx >= 0 &&
+                               static_cast<std::size_t>(libIdx) < neededLibraries.size()) {
+                        nidLibrary = neededLibraries[static_cast<std::size_t>(libIdx)];
+                    } else {
+                        const int modIdx = decodeSceId(nidStr[hash2 + 1]);
+                        if (modIdx > 0 &&
+                            static_cast<std::size_t>(modIdx - 1) < sceModuleNames.size())
+                            nidLibrary = sceModuleNames[static_cast<std::size_t>(modIdx - 1)];
+                    }
+                }
+            } else if (!gnuVersym.empty() &&
+                       static_cast<std::size_t>(symIdx) < gnuVersym.size()) {
+                const std::uint16_t verNdx = static_cast<std::uint16_t>(gnuVersym[symIdx] & 0x7fffu);
+                if (verNdx > 1) {
+                    const auto it = gnuVersionToLibrary.find(verNdx);
+                    if (it != gnuVersionToLibrary.end())
+                        nidLibrary = it->second;
+                }
+            }
+
+            nidRefs.push_back({nidStr, nidLibrary, relType, pos, rOffset, rAddend});
         }
     };
 
@@ -198,6 +334,11 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
 
     for (const auto& ref : nidRefs)
         _validationPolicy->ValidateRelocationTypeSupported(ref.RelocationTypeValue, ref.RelocationTableOffset);
+
+    for (const auto& ref : nidRefs) {
+        if (!ref.Library.empty())
+            _validationPolicy->ValidateNidBelongsToLibrary(ref.Nid, ref.Library);
+    }
 
     if (!textSection.empty())
         _syscallScanner->ScanCodeSectionForSyscalls(textSection, textVAddr, textSection.size());
