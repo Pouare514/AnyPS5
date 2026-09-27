@@ -237,9 +237,8 @@ int APS5_VABI scePthreadGetname(Pthread thread, char* name) {
 }
 
 int APS5_VABI scePthreadGetprio(Pthread thread, int* prio) {
- (void)thread;
- (void)prio;
- NotImplemented_nid_no_patch(__func__);
+ if (thread == nullptr || prio == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+ *prio = thread->prio;
  return 0;
 }
 
@@ -278,9 +277,8 @@ int APS5_VABI scePthreadSetcanceltype(int type, int* old_type) {
 }
 
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
- (void)thread;
- (void)prio;
- NotImplemented_nid_no_patch(__func__);
+ if (thread == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+ thread->prio = prio;
  return 0;
 }
 
