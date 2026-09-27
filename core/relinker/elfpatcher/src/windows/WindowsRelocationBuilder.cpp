@@ -18,6 +18,8 @@ PeRelocations WindowsRelocationBuilder::Apply(WindowsLoadImage& image, const Dom
             const auto addend = Io::ReadU64(table, offset + 16);
             const auto type = static_cast<std::uint32_t>(info);
             const auto symbol = info >> 32;
+            if (!plt && symbol == 0 && type != 8)
+                throw Domain::RelinkerException("Static relocation (type " + std::to_string(type) + ") has no Windows PE equivalent; --windows cannot preserve TLS/static fixups", target);
             if ((plt && type != 7) || (type != 1 && type != 6 && type != 7 && type != 8))
                 throw Domain::RelinkerException("Unsupported Windows relocation type " + std::to_string(type), target);
             const auto rva = image.GetRva(target, 8);

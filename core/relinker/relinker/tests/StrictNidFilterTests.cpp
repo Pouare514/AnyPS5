@@ -159,6 +159,42 @@ void vectorInstructionLengths() {
         require(decoder.Decode(instruction.data(), instruction.size()) == instruction.size(), "Vector immediate or VZEROUPPER was decoded with the wrong length");
 }
 
+void prefixAndBmiInstructionLengths() {
+    // Regression tests for decoder desynchronization found on real game
+    // binaries. (1) 0F B8 (POPCNT) had no ModRM entry, so the decoder
+    // returned 4 instead of 5 and desynchronized the whole region (Legends
+    // eboot broke strict filtering because of it). Siblings fixed at the
+    // same time: UD1, BTC, XADD r8, MOVNTI, PINSRW. (2) clang emits
+    // multi-byte NOP padding with REX before legacy prefixes
+    // (45 66 2E 0F 1F ...), which the prefix loop rejected. (3) INT ib
+    // (0xCD, used for PS5 stack-guard traps in libc.prx) takes an 8-bit
+    // immediate; decoding it as 1 byte desynchronized the region.
+    // (4) RET iw / RETF iw (0xC2/0xCA) pop a 16-bit stack operand.
+    const Codegen::X64InstructionDecoder decoder;
+    const std::vector<std::vector<std::uint8_t>> instructions = {
+        {0xF3, 0x48, 0x0F, 0xB8, 0xC7},
+        {0xF3, 0x0F, 0xB8, 0x85, 0x78, 0x56, 0x34, 0x12},
+        {0xF3, 0x48, 0x0F, 0xBC, 0xC3},
+        {0xF3, 0x0F, 0xBD, 0xC0},
+        {0x0F, 0xBB, 0xC0},
+        {0x0F, 0xBB, 0x84, 0x98, 0x78, 0x56, 0x34, 0x12},
+        {0x0F, 0xC0, 0x01},
+        {0x0F, 0xC3, 0x02},
+        {0x66, 0x0F, 0xC4, 0xC8, 0x00},
+        {0x0F, 0xB9, 0xC0},
+        {0x45, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+        {0x66, 0x2E, 0x45, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+        {0xCD, 0x45},
+        {0xC2, 0x08, 0x00},
+        {0xCA, 0x08, 0x00},
+    };
+    for (const auto& instruction : instructions)
+        require(decoder.Decode(instruction.data(), instruction.size()) == instruction.size(), "BMI/general-purpose two-byte opcode was decoded with the wrong length");
+    const std::vector<std::uint8_t> ripPopcnt = {0xF3, 0x48, 0x0F, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0x00};
+    const auto info = decoder.DecodeInstruction(ripPopcnt.data(), ripPopcnt.size());
+    require(info.Length == ripPopcnt.size() && info.HasRipRelativeDisp, "RIP-relative POPCNT was not recognized");
+}
+
 void exceptionLandingPads() {
     std::vector<std::uint8_t> bytes(0x400);
     write<std::uint32_t>(bytes, 0x200, 15);
@@ -289,6 +325,7 @@ int main() {
         isolatedFunctionCycle();
         relativeTableAndWholeFunction();
         vectorInstructionLengths();
+        prefixAndBmiInstructionLengths();
         exceptionLandingPads();
         filterCallbackDataImports();
         filterAndPltCompaction();

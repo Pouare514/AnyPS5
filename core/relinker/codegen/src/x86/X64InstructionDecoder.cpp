@@ -41,13 +41,19 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
             continue;
         }
 
-        break;
-    }
+        // REX bytes may precede legacy prefixes in the wild: clang emits
+        // multi-byte NOPs such as 45 66 2E 0F 1F ... (REX before 66/2E).
+        // Consume them as prefixes (last one wins) instead of assuming REX
+        // always comes last, otherwise the ModRM byte is misread as a new
+        // opcode and every later instruction desynchronizes.
+        if (b >= RexMin && b <= RexMax) {
+            rexPresent = true;
+            rex = b;
+            pos += 1;
+            continue;
+        }
 
-    if (pos < available && data[pos] >= RexMin && data[pos] <= RexMax) {
-        rexPresent = true;
-        rex = data[pos];
-        pos += 1;
+        break;
     }
 
     if (pos >= available) {
@@ -171,8 +177,12 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
             opcode == OneByteGrp2Rm8Imm8 || opcode == OneByteGrp2RmImm8 ||
             (opcode >= OneByteMovImm8RegMin && opcode <= OneByteMovImm8RegMax) ||
             opcode == OneBytePushImm8 ||
-            opcode == OneByteTestAlImm8) {
+            opcode == OneByteTestAlImm8 ||
+            opcode == OneByteIntImm8) {
             immediateSize = ImmSize8;
+        } else if (opcode == OneByteRetImm16 || opcode == OneByteRetFarImm16) {
+            // RET iw / RETF iw pop an additional 16-bit stack operand.
+            immediateSize = ImmSize16;
         } else if (opcode == OneByteImm32AluCmp || opcode == OneByteMovImm32 ||
                    opcode == OneByteImulRm32Imm32 ||
                    opcode == OneByteImm32AddEax || opcode == OneByteImm32OrEax ||
@@ -232,6 +242,17 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
             immediateSize = ImmSize8;
         } else if (opcode == TwoByteShldCl || opcode == TwoByteShrdCl) {
             hasModRm = true;
+        } else if (opcode == TwoBytePopcnt || opcode == TwoByteUd1 ||
+                   opcode == TwoByteBtc || opcode == TwoByteXadd8 ||
+                   opcode == TwoByteMovnti) {
+            // BMI1/general-purpose opcodes with a ModRM byte but no immediate
+            // (POPCNT, UD1, BTC, XADD r8, MOVNTI). Missing these desynchronizes
+            // every later instruction in the decoded region.
+            hasModRm = true;
+        } else if (opcode == TwoBytePinsrwImm8) {
+            // PINSRW carries an 8-bit immediate after the ModRM (+ optional disp).
+            hasModRm = true;
+            immediateSize = ImmSize8;
         } else if ((opcode >= TwoByteCmovRangeMin && opcode <= TwoByteCmovRangeMax) ||
                    (opcode >= TwoByteModRmRangeAMin && opcode <= TwoByteModRmRangeAMax) ||
                    (opcode >= TwoByteModRmRangeBMin && opcode <= TwoByteModRmRangeBMax) ||
@@ -335,11 +356,15 @@ DecodedInstructionInfo X64InstructionDecoder::DecodeInstruction(
             ++pos;
             continue;
         }
+        // Mirror Decode(): a REX byte may appear before legacy prefixes
+        // (e.g. clang NOP padding). Keep the last one as the effective REX.
+        if (b >= RexMin && b <= RexMax) {
+            info.RexPrefix = b;
+            ++pos;
+            continue;
+        }
         break;
     }
-
-    if (pos < info.Length && data[pos] >= RexMin && data[pos] <= RexMax)
-        info.RexPrefix = data[pos++];
 
     info.OpcodeOffset = pos;
 
@@ -499,6 +524,8 @@ DecodedInstructionInfo X64InstructionDecoder::DecodeInstruction(
             op == TwoByteImulRmModRm || op == TwoByteGrp7 ||
             op == TwoByteGrp15 || op == TwoByteXadd ||
             op == TwoByteGrp9 || op == TwoByteNopModRm ||
+            op == TwoBytePopcnt || op == TwoByteUd1 || op == TwoByteBtc ||
+            op == TwoByteXadd8 || op == TwoByteMovnti || op == TwoBytePinsrwImm8 ||
             op == TwoByteEndbr || op == TwoByteMovImm8ModRm ||
             (op >= TwoByteShiftImm8Min && op <= TwoByteShiftImm8Max) ||
             op == TwoByteShldImm8 || op == TwoByteShrdImm8 ||
