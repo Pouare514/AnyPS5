@@ -10,6 +10,13 @@ class ElfReader : public IElfReader {
 public:
     explicit ElfReader(std::vector<std::uint8_t> fileBuffer);
 
+    // PS5 SELF support (plaintext dumps, e.g. eboot.bin with magic 4F153D1D).
+    // MaybeUnwrapSelfImage returns the unwrapped ELF image when the input is a
+    // SELF container, otherwise returns the input unchanged.
+    static bool IsSelfImage(const std::vector<std::uint8_t>& bytes);
+    static std::vector<std::uint8_t> UnwrapSelfImage(const std::vector<std::uint8_t>& bytes);
+    static std::vector<std::uint8_t> MaybeUnwrapSelfImage(std::vector<std::uint8_t> bytes);
+
     ElfHeader ReadHeader() const override;
     std::vector<ProgramHeader> ReadProgramHeaders() const override;
     std::vector<SectionHeader> ReadSectionHeaders() const override;

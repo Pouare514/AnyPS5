@@ -39,6 +39,11 @@ int main(const int argc, char* argv[]) {
         auto sourceBytes = fileReader.Read(args.inputPath);
         const std::string absPath = std::filesystem::absolute(args.outputPath).string();
 
+        if (Relinker::ElfReader::IsSelfImage(sourceBytes)) {
+            std::cout << "Input is a PS5 SELF container; unwrapping to ELF in memory (input file left untouched)\n";
+            sourceBytes = Relinker::ElfReader::MaybeUnwrapSelfImage(std::move(sourceBytes));
+        }
+
         if (args.toIntel) {
             std::cout << "Mode: Intel instruction conversion; system unchanged; unused-filter=" << args.unusedFilterLevel << " (not applied)\n";
 
