@@ -3,6 +3,7 @@
 #include <elfpatcher/windows/WindowsDependencyStubBuilder.hpp>
 #include <io/BufferUtils.hpp>
 #include <algorithm>
+#include <map>
 #include <optional>
 
 namespace Elfpatcher::Windows {
@@ -72,6 +73,24 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     for (const auto& import : imports)
         symbolNames.push_back(addString(import.Name));
 
+    // Stub policy (emulator-style): every distinct NID gets one stub
+    // trampoline so an unresolved import binds to a stub instead of killing
+    // the boot. Map each import to its unique-NID index here; resolution
+    // itself still happens at runtime via GetProcAddress.
+    std::vector<std::size_t> importUid;
+    importUid.reserve(imports.size());
+    std::vector<std::string> uniqueNames;
+    std::vector<std::size_t> firstImport;
+    std::map<std::string, std::size_t> uidByName;
+    for (std::size_t index = 0; index < imports.size(); ++index) {
+        const auto [it, inserted] = uidByName.emplace(imports[index].Name, uniqueNames.size());
+        if (inserted) {
+            uniqueNames.push_back(imports[index].Name);
+            firstImport.push_back(index);
+        }
+        importUid.push_back(it->second);
+    }
+
     const auto lastError = reserve(4);
     const auto errorDigits = reserve(11);
     const auto errorMessage = reserve(ErrorMessageCapacity);
@@ -81,8 +100,6 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto errorPrefix = addString("GetLastError: ");
     const auto messageSeparator = addString(" - ");
     const auto newline = addString("\n");
-    const auto searched = addString("Searched libraries:\n");
-    const auto indent = addString("  ");
     const auto enteringElf = addString("Transferring control to ELF entry point\n");
     std::vector<std::uint32_t> resolvedPaths;
     for (std::size_t index = 0; index < libraries.size(); ++index)
@@ -97,6 +114,24 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         errorRvas.push_back(addString(error));
     if (data.size() <= diagnosticsOffset)
         throw Domain::RelinkerException("Empty startup diagnostics");
+
+    // Stub policy (emulator-style) data. One flag byte per unique NID records
+    // whether the call-time log already fired, one counter caps the total
+    // number of call-time logs (first 1024, like Kyty's UnresolvedImportStub),
+    // and one table maps the stub index to its NID name string for logging.
+    // The per-NID bind messages are logged once at startup when GetProcAddress
+    // fails, so one run reveals every missing import.
+    const auto stubFlags = reserve(uniqueNames.size());
+    const auto stubLogCount = reserve(4);
+    const auto stubNameTable = CheckedRva(dataRva + data.size());
+    for (std::size_t uid = 0; uid < uniqueNames.size(); ++uid)
+        Io::AppendU32(data, symbolNames.at(firstImport.at(uid)));
+    const auto stubCallPrefix = addString("STUB: called unresolved ELF import ");
+    std::vector<std::uint32_t> stubBindMessages;
+    for (const auto& name : uniqueNames)
+        stubBindMessages.push_back(addString("STUB: unresolved ELF import " + name + "\n"));
+    const auto stubUnwindRva = CheckedRva(dataRva + data.size());
+    data.insert(data.end(), {1, 4, 1, 0, 4, 0xa1, 0, 0});
 
     std::optional<WindowsDependencyStubBuilder> dependencyBuilder;
     if (dependencyDiagnostics)
@@ -268,8 +303,16 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         }
     }
 
-    std::vector<std::size_t> unresolvedBranches;
-    std::vector<std::size_t> lazyUnresolvedImports;
+    // Forward references to the per-NID stub trampolines emitted after the
+    // main bootstrap body: {rel32 field offset, unique-NID index}.
+    std::vector<std::pair<std::size_t, std::size_t>> stubLeaFixups;
+    // Windows lazy binding is aligned to the stub policy (ret-0 stubs) for
+    // partial-boot consistency: both eager and lazy bind unresolved imports
+    // to the shared log-once/return-0 trampolines instead of failing. The
+    // flag is accepted for CLI compatibility (Linux uses it for DF_BIND_NOW)
+    // but has no effect on Windows. See e2e: lazy boot now exits 42 with the
+    // same STUB lines instead of faulting on first call.
+    (void)lazyBinding;
     for (std::size_t index = 0; index < imports.size(); ++index) {
         code.Rip({0x48, 0x8d, 0x1d}, handles);
         code.Rip({0x48, 0x8d, 0x35}, symbolNames[index]);
@@ -282,29 +325,40 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         const auto resolved = code.Branch({0x0f, 0x85});
         code.Emit({0x48, 0x83, 0xc3, 8, 0xff, 0xcd});
         code.Rip({0x0f, 0x85}, search);
-        if (lazyBinding) {
-            lazyUnresolvedImports.push_back(index);
-            const auto skipGotWrite = code.Branch({0xe9});
-            code.PatchBranch(resolved, code.GetRva());
-            if (imports[index].Addend != 0) {
-                code.Emit({0x48, 0xba});
-                code.U64(imports[index].Addend);
-                code.Emit({0x48, 0x01, 0xd0});
-            }
-            code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
-            code.PatchBranch(skipGotWrite, code.GetRva());
-            continue;
-        }
-        captureLastError();
-        writeString(errorRvas.at(3 + index), true);
-        unresolvedBranches.push_back(code.Branch({0xe9}));
+        // Stub policy: the import was not found in any library. Log the NID
+        // once (first occurrence), bind the GOT slot to this NID's stub
+        // trampoline, and keep booting so one run reveals every missing
+        // import. The stub logs on first call (capped) and returns 0, and is
+        // callable with any signature.
+        //
+        // R_X86_64_64 nonzero-addend corner: GOT = stub address (addend
+        // intentionally skipped for stubs). The stub address stands for the
+        // symbol value itself; GOT = stub + addend would point past the
+        // 10-byte trampoline into the middle of the jmp/logger and break
+        // callability (the common case: unresolved functions). Resolved
+        // imports still apply GOT = address + addend below. Data pointers
+        // with a nonzero addend therefore read as stub + 0 bias; this keeps
+        // the boot alive so one run reveals every missing NID, at the cost
+        // of a shifted data view for that corner (documented, covered by
+        // the R_X86_64_64 e2e where a called addend-8 stub still returns 0).
+        const auto uid = importUid.at(index);
+        if (firstImport.at(uid) == index)
+            writeString(stubBindMessages.at(uid));
+        stubLeaFixups.emplace_back(code.Branch({0x48, 0x8d, 0x05}), uid);
+        code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
+        std::size_t skipAddend = 0;
+        const bool hasAddend = imports[index].Addend != 0;
+        if (hasAddend)
+            skipAddend = code.Branch({0xe9});
         code.PatchBranch(resolved, code.GetRva());
-        if (imports[index].Addend != 0) {
+        if (hasAddend) {
             code.Emit({0x48, 0xba});
             code.U64(imports[index].Addend);
             code.Emit({0x48, 0x01, 0xd0});
         }
         code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
+        if (hasAddend)
+            code.PatchBranch(skipAddend, code.GetRva());
     }
 
     writeString(enteringElf);
@@ -317,45 +371,113 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     call("ExitProcess");
     code.Emit({0x0f, 0x0b});
 
-    if (!unresolvedBranches.empty()) {
-        for (const auto branch : unresolvedBranches)
-            code.PatchBranch(branch, code.GetRva());
-        writeString(searched, true);
-        for (const auto resolvedPath : resolvedPaths) {
-            writeString(indent, true);
-            writeString(resolvedPath, true);
-            writeString(newline, true);
-        }
-        writeLastError();
-        raise(0xc0000139u);
-    }
-
     const auto functionEnd = code.GetRva();
     code.PatchBranch(exitCallback, functionEnd);
     code.Emit({0xc3});
 
-    for (const auto index : lazyUnresolvedImports) {
-        const auto stubRva = code.GetRva();
-        writeString(errorRvas.at(3 + index), true);
-        raise(0xc0000139u);
-        result.LazyStubs.push_back({imports[index].TargetRva, stubRva});
+    // LazyStubs stays empty: unresolved imports are bound to ret-0
+    // trampolines above in both modes, so WindowsPePatcher.writeGotStub has
+    // nothing to patch. The field is retained for API compatibility.
+
+    // Shared unresolved-import stub (emulator-style, cf. Kyty's
+    // UnresolvedImportStub). Entered with the unique-NID index in ecx via a
+    // per-NID trampoline. Logs the NID on first call per NID (capped at 1024
+    // total logs) and returns 0. Only volatile registers under both the
+    // Windows x64 and System V AMD64 ABIs (rax, rcx, rdx, r8-r11) are touched,
+    // so the stub is callable with any signature; xmm0 is also zeroed so
+    // floating-point returns read +0.0. Failures while logging are silently
+    // skipped: a stub must never kill the game.
+    const auto writeStubString = [&](const bool dynamic, const std::uint32_t stringRva) {
+        if (dynamic)
+            code.Emit({0x48, 0x8b, 0x4c, 0x24, 0x48});
+        else
+            code.Rip({0x48, 0x8d, 0x0d}, stringRva);
+        call("lstrlenA");
+        code.Emit({0x48, 0x85, 0xc0});
+        const auto empty = code.Branch({0x0f, 0x84});
+        code.Emit({0x89, 0x44, 0x24, 0x3c, 0xb9});
+        code.U32(0xfffffff5u);
+        call("GetStdHandle");
+        code.Emit({0x48, 0x85, 0xc0});
+        const auto noHandle = code.Branch({0x0f, 0x84});
+        code.Emit({0x48, 0x83, 0xf8, 0xff});
+        const auto invalidHandle = code.Branch({0x0f, 0x84});
+        code.Emit({0x48, 0x89, 0xc1});
+        if (dynamic)
+            code.Emit({0x48, 0x8b, 0x54, 0x24, 0x48});
+        else
+            code.Rip({0x48, 0x8d, 0x15}, stringRva);
+        code.Emit({0x44, 0x8b, 0x44, 0x24, 0x3c, 0x4c, 0x8d, 0x4c, 0x24, 0x38, 0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0});
+        call("WriteFile");
+        const auto next = code.GetRva();
+        code.PatchBranch(empty, next);
+        code.PatchBranch(noHandle, next);
+        code.PatchBranch(invalidHandle, next);
+    };
+
+    const auto stubLoggerRva = code.GetRva();
+    code.Emit({0x48, 0x83, 0xec, 0x58});
+    code.Emit({0x89, 0x4c, 0x24, 0x40});
+    code.Rip({0x48, 0x8d, 0x15}, stubFlags);
+    code.Emit({0x8b, 0x44, 0x24, 0x40});
+    code.Emit({0x80, 0x3c, 0x02, 0x00});
+    const auto alreadyLogged = code.Branch({0x0f, 0x85});
+    code.Emit({0xc6, 0x04, 0x02, 0x01});
+    code.Rip({0x8b, 0x05}, stubLogCount);
+    code.Emit({0x3d, 0x00, 0x04, 0x00, 0x00});
+    const auto logCapped = code.Branch({0x0f, 0x83});
+    code.PatchBranch(code.Branch({0xf0, 0xff, 0x05}), stubLogCount);
+    code.Rip({0x48, 0x8d, 0x15}, stubNameTable);
+    code.Emit({0x8b, 0x44, 0x24, 0x40});
+    code.Emit({0x8b, 0x04, 0x82});
+    const auto getBase = code.Branch({0xe8});
+    const auto popRva = code.GetRva();
+    code.PatchBranch(getBase, popRva);
+    code.Emit({0x5a});
+    code.Emit({0x48, 0x81, 0xea});
+    code.U32(popRva);
+    code.Emit({0x48, 0x01, 0xc2});
+    code.Emit({0x48, 0x89, 0x54, 0x24, 0x48});
+    writeStubString(false, stubCallPrefix);
+    writeStubString(true, 0);
+    writeStubString(false, newline);
+    const auto returnZero = code.GetRva();
+    code.PatchBranch(alreadyLogged, returnZero);
+    code.PatchBranch(logCapped, returnZero);
+    code.Emit({0x0f, 0x57, 0xc0, 0x31, 0xc0, 0x48, 0x83, 0xc4, 0x58, 0xc3});
+    const auto stubLoggerEnd = code.GetRva();
+
+    // One trampoline per unique NID: load the stub index, jump to the shared
+    // logger. Ten bytes, no faulting instructions, entered via the bound GOT
+    // slot with any signature.
+    std::vector<std::uint32_t> stubTrampolines;
+    for (std::size_t uid = 0; uid < uniqueNames.size(); ++uid) {
+        stubTrampolines.push_back(code.GetRva());
+        code.Emit({0xb9});
+        code.U32(static_cast<std::uint32_t>(uid));
+        code.Rip({0xe9}, stubLoggerRva);
     }
+    for (const auto& [offset, uid] : stubLeaFixups)
+        code.PatchBranch(offset, stubTrampolines.at(uid));
 
     Io::WriteU32(data, functionTable - dataRva, result.Code.Rva);
     Io::WriteU32(data, functionTable - dataRva + 4, functionEnd);
     Io::WriteU32(data, functionTable - dataRva + 8, unwindRva);
-    auto exceptionEntries = CheckedRva(1);
+    Io::WriteU32(data, functionTable - dataRva + 12, stubLoggerRva);
+    Io::WriteU32(data, functionTable - dataRva + 16, stubLoggerEnd);
+    Io::WriteU32(data, functionTable - dataRva + 20, stubUnwindRva);
+    auto exceptionEntries = CheckedRva(2);
     if (dependencyBuilder.has_value()) {
         const auto dependency = dependencyBuilder->Build(code, nativeImports);
         for (const auto offset : dependencyCalls)
             code.PatchBranch(offset, dependency.EntryRva);
-        if (dependency.Functions.size() >= 32)
+        if (dependency.Functions.size() >= 31)
             throw Domain::RelinkerException("Too many dependency diagnostic routines");
         for (std::size_t index = 0; index < dependency.Functions.size(); ++index) {
             for (std::size_t field = 0; field < 3; ++field)
-                Io::WriteU32(data, functionTable - dataRva + (index + 1) * 12 + field * 4, dependency.Functions[index][field]);
+                Io::WriteU32(data, functionTable - dataRva + (index + 2) * 12 + field * 4, dependency.Functions[index][field]);
         }
-        exceptionEntries = CheckedRva(dependency.Functions.size() + 1);
+        exceptionEntries = CheckedRva(dependency.Functions.size() + 2);
     }
     result.ExceptionDirectory = {functionTable, CheckedRva(exceptionEntries * 12)};
     result.Code.Data = code.TakeBytes();
