@@ -30,6 +30,13 @@ function(add_shader_recompiler target runtimeTarget)
                 EXCLUDE_FROM_ALL
         )
     endif()
+    # Same Debug-postfix mismatch as in libSceAgcDriver: clear it when this
+    # function is the one that vendored glslang.
+    foreach(_recompiler_glslang_target IN ITEMS SPIRV glslang glslang-default-resource-limits OSDependent MachineIndependent GenericCodeGen)
+        if(TARGET ${_recompiler_glslang_target})
+            set_target_properties(${_recompiler_glslang_target} PROPERTIES DEBUG_POSTFIX "")
+        endif()
+    endforeach()
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
