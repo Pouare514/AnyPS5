@@ -153,8 +153,47 @@ bool ReuseFixedMapping(GuestAllocations::Mutation& mutation, void* addr, size_t 
     return true;
 }
 
-void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
-    ValidateLength(len);
+#ifdef _WIN32
+// Fixed mapping at PS5 (16K) granularity with no covering reservation: Windows views need
+// 64K alignment, so reserve a 64K-aligned PROT_NONE cover first and reuse it. Returns true
+// when the mapping went through the cover; false leaves everything untouched.
+bool ReserveAndReuseFixedMapping(GuestAllocations::Mutation& mutation, void* addr, size_t len,
+                                 int sceProt, int posixProt, int flags, size_t alignment) {
+    constexpr uintptr_t nativeGranularity = 0x10000u;
+    const auto          start             = reinterpret_cast<uintptr_t>(addr);
+    if ((start & (nativeGranularity - 1)) == 0) return false;
+    const auto limit = std::numeric_limits<uintptr_t>::max();
+    if (len > limit - start) return false;
+    const auto coverStart = start & ~(nativeGranularity - 1);
+    const auto coverEnd   = (start + len + nativeGranularity - 1) & ~(nativeGranularity - 1);
+    if (coverEnd <= coverStart || coverEnd - coverStart < len) return false;
+    const auto coverLen = static_cast<size_t>(coverEnd - coverStart);
+    void*      cover    = nullptr;
+    try {
+        cover = GuestMemoryBacking::GuestMemoryBackingMap_nid_postfix(
+            reinterpret_cast<void*>(coverStart), coverLen, nativeGranularity, 0);
+    } catch (...) {
+        return false;
+    }
+    try {
+        mutation.Add(cover, coverLen, false, false);
+    } catch (...) {
+        Unmap(cover, coverLen);
+        return false;
+    }
+    if (!ReuseFixedMapping(mutation, addr, len, sceProt, posixProt, flags, alignment)) {
+        try {
+            mutation.Remove(cover);
+        } catch (...) {
+        }
+        Unmap(cover, coverLen);
+        return false;
+    }
+    return true;
+}
+#endif
+
+void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {    ValidateLength(len);
     alignment = ValidateAlignment(alignment);
     constexpr int guestMapFixed = 0x10;
     constexpr int guestMapNoCoalesce = 0x400000;
@@ -182,7 +221,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     GuestAllocations::Mutation mutation;
     if (*addr != nullptr) {
         const int posixProt = LinuxProtFromSce(prot);
-        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)) {
+        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)
+#ifdef _WIN32
+            && !ReserveAndReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)
+#endif
+        ) {
             mutation.RequireAvailable(*addr, len);
             void* mapped = MapAligned(*addr, len, posixProt, flags, alignment);
             try {
@@ -212,7 +255,12 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     GuestAllocations::Mutation mutation;
     if (*addr != nullptr) {
         const int posixProt = LinuxProtFromSce(prot);
-        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE)) {
+        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE)
+#ifdef _WIN32
+            && !ReserveAndReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags,
+                                            PS5_PAGE_SIZE)
+#endif
+        ) {
             mutation.RequireAvailable(*addr, len);
             void* mapped = MapAligned(*addr, len, posixProt, flags, PS5_PAGE_SIZE);
             try {
