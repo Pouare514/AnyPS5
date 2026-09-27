@@ -207,8 +207,11 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         case DescriptorRole::GuestSamplers:
             physical.guestDescriptor = GuestSamplersDescriptor(logical.resources, snapshot);
             for (std::size_t element = 0; element < logical.resources.size(); ++element) {
+                // SAMPLE_C is lowered to a regular sample plus an ALU compare. A comparison
+                // sampler is illegal with non-Dref SPIR-V, and host sampled views are color
+                // formats anyway, so the sampler stays non-comparison.
+                physical.samplerDepthCompare.push_back(false);
                 const auto& sampler = info.samplers.at(logical.resources[element]);
-                physical.samplerDepthCompare.push_back(sampler.depthCompare);
                 if (sampler.forcePointFiltering) {
                     auto& filter = physical.guestDescriptor.at(element * 4u + 2u);
                     const bool mipmapped = ((filter >> 26u) & 3u) != 0u;

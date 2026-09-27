@@ -145,9 +145,11 @@ void RunGuestSamplerResourceTests() {
         Require(!decoded.compareEnable, "sampler descriptor enabled comparison without shader metadata");
     }
 
-    Fields badUnorm = base;
-    badUnorm.forceUnormCoords = true;
-    rejectFields(badUnorm, "unnormalized coordinates");
+    Fields unorm = base;
+    unorm.forceUnormCoords = true;
+    result = DecodeSamplerResource(pack(unorm));
+    Require(result.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && result.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "unnormalized sampler must clamp to edge");
+    Require(result.minLod == 0.0f && result.maxLod == 0.0f && !result.anisotropyEnable, "unnormalized sampler must sample level zero without anisotropy");
 
     Fields badThreshold = base;
     badThreshold.anisoThreshold = 1;
