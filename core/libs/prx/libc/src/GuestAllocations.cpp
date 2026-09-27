@@ -170,6 +170,23 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
     throw std::runtime_error("guest allocation is not registered");
 }
 
+bool GuestAllocationsFindCoveringReservation_nid_postfix(void*, const void* pointer, std::size_t bytes, Range* out) {
+    if (out == nullptr) throw std::invalid_argument("missing covering reservation output");
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto end = address + bytes;
+    for (const auto& [base, range] : registry().ranges) {
+        if (base > address) break;
+        if (address < base || end > base + range->bytes) continue;
+        if (!range->readable && !range->writable && range->releasable) {
+            *out = {range->address, range->bytes, range->readable, range->writable, range->allocationAddress, range->allocationBytes, range->releasable};
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);

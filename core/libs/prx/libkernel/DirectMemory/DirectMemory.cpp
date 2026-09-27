@@ -76,6 +76,49 @@ void Unmap(void* addr, size_t len) {
     GuestMemoryBacking::GuestMemoryBackingUnmap_nid_postfix(addr, len);
 }
 
+struct ClaimedReservation {
+    bool claimed = false;
+    void* prefixAddr = nullptr;
+    size_t prefixLen = 0;
+    void* suffixAddr = nullptr;
+    size_t suffixLen = 0;
+};
+
+ClaimedReservation ClaimCoveringReservation(GuestAllocations::Mutation& mutation, void* addr, size_t len) {
+    ClaimedReservation result;
+    if (addr == nullptr) return result;
+    GuestAllocations::Range covering{};
+    if (!mutation.FindCoveringReservation(addr, len, &covering)) return result;
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    const auto base = covering.address;
+    const auto size = covering.bytes;
+    if (base > start || start + len > base + size) return result;
+    if ((size & (PS5_PAGE_SIZE - 1)) != 0) return result;
+    void* wholeAddr = reinterpret_cast<void*>(base);
+    // The covering reservation may be registry-only (no backing) when it is a
+    // prefix/suffix fragment from a previous claim; its backing unmap is then a no-op.
+    try {
+        mutation.Unmap(wholeAddr, size, [&](const void*, bool) {
+            try {
+                Unmap(wholeAddr, size);
+            } catch (const std::exception&) {
+            }
+        });
+    } catch (const std::exception&) {
+        return result;
+    }
+    result.claimed = true;
+    if (start > base) {
+        result.prefixAddr = reinterpret_cast<void*>(base);
+        result.prefixLen = static_cast<size_t>(start - base);
+    }
+    if (start + len < base + size) {
+        result.suffixAddr = reinterpret_cast<void*>(start + len);
+        result.suffixLen = static_cast<size_t>(base + size - (start + len));
+    }
+    return result;
+}
+
 void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateLength(len);
     alignment = ValidateAlignment(alignment);
@@ -103,7 +146,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         return SCE_KERNEL_ERROR_EINVAL;
     }
     GuestAllocations::Mutation mutation;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
+    ClaimedReservation claimed;
+    if (*addr != nullptr) {
+        claimed = ClaimCoveringReservation(mutation, *addr, len);
+        mutation.RequireAvailable(*addr, len);
+    }
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
@@ -112,6 +159,10 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         throw;
     }
     *addr = mapped;
+    // Remaining reservation fragments stay tracked without backing: Windows fixed views
+    // require 64K alignment while PS5 pages are 16K, so non-64K fragments cannot get views.
+    if (claimed.prefixLen != 0) mutation.Add(claimed.prefixAddr, claimed.prefixLen, false, false);
+    if (claimed.suffixLen != 0) mutation.Add(claimed.suffixAddr, claimed.suffixLen, false, false);
     return 0;
 }
 
@@ -119,7 +170,11 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
+    ClaimedReservation claimed;
+    if (*addr != nullptr) {
+        claimed = ClaimCoveringReservation(mutation, *addr, len);
+        mutation.RequireAvailable(*addr, len);
+    }
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
@@ -128,6 +183,9 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
         throw;
     }
     *addr = mapped;
+    // See DoMapDirect: fragments stay registry-only (Windows 64K vs PS5 16K).
+    if (claimed.prefixLen != 0) mutation.Add(claimed.prefixAddr, claimed.prefixLen, false, false);
+    if (claimed.suffixLen != 0) mutation.Add(claimed.suffixAddr, claimed.suffixLen, false, false);
     return 0;
 }
 
