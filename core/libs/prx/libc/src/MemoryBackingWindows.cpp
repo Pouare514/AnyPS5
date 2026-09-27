@@ -1,6 +1,7 @@
 #include "prx/libc/include/MemoryBackingPlatform.hpp"
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #ifndef NOMINMAX
@@ -27,7 +28,12 @@ Mapping Map(void* address, std::size_t bytes, std::size_t alignment, int protect
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     alignment = std::max(alignment, static_cast<std::size_t>(info.dwAllocationGranularity));
-    if (address != nullptr && reinterpret_cast<std::uintptr_t>(address) % info.dwAllocationGranularity != 0) throw std::invalid_argument("fixed guest view is not aligned to native allocation granularity");
+    if (address != nullptr && reinterpret_cast<std::uintptr_t>(address) % info.dwAllocationGranularity != 0) {
+        std::ostringstream msg;
+        msg << "fixed guest view is not aligned to native allocation granularity: addr=0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(address) << " bytes=0x" << bytes << " alignment=0x" << alignment;
+        throw std::invalid_argument(msg.str());
+    }
     const auto size = static_cast<std::uint64_t>(bytes);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(size >> 32u), static_cast<DWORD>(size), nullptr);
     check(section != nullptr, "CreateFileMapping guest backing");
