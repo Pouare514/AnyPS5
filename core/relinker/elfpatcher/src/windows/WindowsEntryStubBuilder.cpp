@@ -1,6 +1,7 @@
 #include <elfpatcher/windows/WindowsEntryStubBuilder.hpp>
 #include <elfpatcher/windows/WindowsStubEmitter.hpp>
 #include <elfpatcher/windows/WindowsDependencyStubBuilder.hpp>
+#include <elfpatcher/windows/WindowsGuestStartup.hpp>
 #include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <map>
@@ -30,7 +31,7 @@ std::string normalizeRunPath(std::string path) {
 
 }
 
-WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics) const {
+WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules) const {
     if (!imports.empty() && libraries.empty())
         throw Domain::RelinkerException("ELF imports have no DT_NEEDED libraries");
     const auto path = normalizeRunPath(runPath);
@@ -55,14 +56,17 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto programPath = reserve(PathCapacity);
     const auto modulePath = reserve(PathCapacity);
     const auto handles = reserve(libraries.size() * 8);
+    const auto guestFinished = reserve(4);
+    const WindowsGuestStartup guestStartup;
     const auto functionTable = reserve(12 * 32);
     const auto unwindRva = CheckedRva(dataRva + data.size());
     data.insert(data.end(), {1, 10, 6, 0, 10, 0xb2, 6, 0xc0, 4, 0x70, 3, 0x60, 2, 0x50, 1, 0x30});
 
     std::vector<std::uint32_t> libraryPaths;
     std::vector<std::string> libraryNames;
-    for (const auto& library : libraries) {
-        auto name = path + library;
+    for (std::size_t index = 0; index < libraries.size(); ++index) {
+        auto name = index < guestModules.size() ? libraries[index] : path + libraries[index];
+        std::replace(name.begin(), name.end(), '/', '\\');
         if (name.size() + 1 >= PathCapacity)
             throw Domain::RelinkerException("Windows library path exceeds the startup buffer: " + name);
         libraryPaths.push_back(addString(name));
@@ -97,6 +101,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto loading = addString("Loading PRX: ");
     const auto loaded = addString(" -> OK\n");
     const auto loadFailed = addString(" -> FAILED\n");
+    const auto failedModule = addString("Failed to load module: ");
     const auto errorPrefix = addString("GetLastError: ");
     const auto messageSeparator = addString(" - ");
     const auto newline = addString("\n");
@@ -253,7 +258,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     code.Emit({0x49, 0xff, 0xc4});
 
     for (std::size_t index = 0; index < libraries.size(); ++index) {
-        if (absolutePath) {
+        if (absolutePath && index >= guestModules.size()) {
             code.Rip({0x48, 0x8d, 0x0d}, libraryPaths[index]);
         } else {
             code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
@@ -288,6 +293,9 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         const auto loadSucceeded = code.Branch({0x0f, 0x85});
         captureLastError();
         writeString(loadFailed, true);
+        writeString(failedModule, true);
+        writeString(resolvedPaths[index], true);
+        writeString(newline, true);
         writeLastError();
         if (dependencyDiagnostics) {
             code.Rip({0x48, 0x8d, 0x0d}, resolvedPaths[index]);
@@ -303,17 +311,22 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         }
     }
 
+    std::vector<std::size_t> lazyUnresolvedImports;
+    std::vector<std::size_t> tlsResolverAddresses;
     // Forward references to the per-NID stub trampolines emitted after the
     // main bootstrap body: {rel32 field offset, unique-NID index}.
     std::vector<std::pair<std::size_t, std::size_t>> stubLeaFixups;
-    // Windows lazy binding is aligned to the stub policy (ret-0 stubs) for
-    // partial-boot consistency: both eager and lazy bind unresolved imports
-    // to the shared log-once/return-0 trampolines instead of failing. The
-    // flag is accepted for CLI compatibility (Linux uses it for DF_BIND_NOW)
-    // but has no effect on Windows. See e2e: lazy boot now exits 42 with the
-    // same STUB lines instead of faulting on first call.
-    (void)lazyBinding;
+    // Lazy unresolved imports bound to the same trampolines through the
+    // LazyStubs file-patch mechanism (resolved after trampoline emission):
+    // {import index, unique-NID index}.
+    std::vector<std::pair<std::size_t, std::size_t>> lazyStubFixups;
     for (std::size_t index = 0; index < imports.size(); ++index) {
+        if (!guestModules.empty() && guestModules.front().UsePlatformTlsResolver && imports[index].Name == "vNe1w4diLCs") {
+            if (imports[index].Addend != 0) throw Domain::RelinkerException("TLS resolver import has an addend");
+            tlsResolverAddresses.push_back(code.Branch({0x48, 0x8d, 0x05}));
+            guestStartup.WriteImport(code, imports[index], handles);
+            continue;
+        }
         code.Rip({0x48, 0x8d, 0x1d}, handles);
         code.Rip({0x48, 0x8d, 0x35}, symbolNames[index]);
         code.Emit({0xbd});
@@ -325,59 +338,72 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         const auto resolved = code.Branch({0x0f, 0x85});
         code.Emit({0x48, 0x83, 0xc3, 8, 0xff, 0xcd});
         code.Rip({0x0f, 0x85}, search);
-        // Stub policy: the import was not found in any library. Log the NID
-        // once (first occurrence), bind the GOT slot to this NID's stub
-        // trampoline, and keep booting so one run reveals every missing
-        // import. The stub logs on first call (capped) and returns 0, and is
-        // callable with any signature.
-        //
-        // R_X86_64_64 nonzero-addend corner: GOT = stub address (addend
-        // intentionally skipped for stubs). The stub address stands for the
-        // symbol value itself; GOT = stub + addend would point past the
-        // 10-byte trampoline into the middle of the jmp/logger and break
-        // callability (the common case: unresolved functions). Resolved
-        // imports still apply GOT = address + addend below. Data pointers
-        // with a nonzero addend therefore read as stub + 0 bias; this keeps
-        // the boot alive so one run reveals every missing NID, at the cost
-        // of a shifted data view for that corner (documented, covered by
-        // the R_X86_64_64 e2e where a called addend-8 stub still returns 0).
+        // Stub policy: an import missing from every library binds its GOT slot
+        // to this NID's shared ret-0 trampoline (logged once at bind and once
+        // at first call, capped) instead of failing the boot, so one run
+        // reveals every missing NID. The R_X86_64_64 nonzero-addend corner
+        // binds GOT = stub address (addend skipped): the stub address stands
+        // for the symbol value itself.
+        if (lazyBinding) {
+            // Deferred through the LazyStubs file-patch mechanism, bound to
+            // the trampolines after their emission below.
+            lazyUnresolvedImports.push_back(index);
+            const auto luid = importUid.at(index);
+            if (firstImport.at(luid) == index)
+                writeString(stubBindMessages.at(luid));
+            lazyStubFixups.emplace_back(index, luid);
+            const auto skipGotWrite = code.Branch({0xe9});
+            code.PatchBranch(resolved, code.GetRva());
+            if (imports[index].Addend != 0) {
+                code.Emit({0x48, 0xba});
+                code.U64(imports[index].Addend);
+                code.Emit({0x48, 0x01, 0xd0});
+            }
+            guestStartup.WriteImport(code, imports[index], handles);
+            code.PatchBranch(skipGotWrite, code.GetRva());
+            continue;
+        }
         const auto uid = importUid.at(index);
         if (firstImport.at(uid) == index)
             writeString(stubBindMessages.at(uid));
         stubLeaFixups.emplace_back(code.Branch({0x48, 0x8d, 0x05}), uid);
         code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
-        std::size_t skipAddend = 0;
-        const bool hasAddend = imports[index].Addend != 0;
-        if (hasAddend)
-            skipAddend = code.Branch({0xe9});
+        const auto stubDone = code.Branch({0xe9});
         code.PatchBranch(resolved, code.GetRva());
-        if (hasAddend) {
+        if (imports[index].RelocationType == 16) code.Emit({0x48, 0x8b, 0x00});
+        if (imports[index].RelocationType == 17) code.Emit({0x48, 0x8b, 0x40, 8});
+        if (imports[index].Addend != 0) {
             code.Emit({0x48, 0xba});
             code.U64(imports[index].Addend);
             code.Emit({0x48, 0x01, 0xd0});
         }
         code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
-        if (hasAddend)
-            code.PatchBranch(skipAddend, code.GetRva());
+        guestStartup.WriteImport(code, imports[index], handles);
+        code.PatchBranch(stubDone, code.GetRva());
     }
 
+    guestStartup.Initialize(code, guestModules, handles);
     writeString(enteringElf);
     code.Emit({0x48, 0xc7, 0x44, 0x24, 0x40, 1, 0, 0, 0});
     code.Rip({0x48, 0x8d, 0x05}, programPath);
     code.Emit({0x48, 0x89, 0x44, 0x24, 0x48, 0x31, 0xc0, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x58, 0x48, 0x8d, 0x7c, 0x24, 0x40});
     const auto exitCallback = code.Branch({0x48, 0x8d, 0x35});
     code.Rip({0xe8}, entryRva);
+    code.Emit({0x89, 0x44, 0x24, 0x58});
+    guestStartup.Finalize(code, guestModules, handles, guestFinished);
+    code.Emit({0x8b, 0x44, 0x24, 0x58});
     code.Emit({0x89, 0xc1});
     call("ExitProcess");
     code.Emit({0x0f, 0x0b});
 
     const auto functionEnd = code.GetRva();
     code.PatchBranch(exitCallback, functionEnd);
+    code.Emit({0x48, 0x83, 0xec, 0x28});
+    guestStartup.Finalize(code, guestModules, handles, guestFinished);
+    code.Emit({0x48, 0x83, 0xc4, 0x28});
     code.Emit({0xc3});
-
-    // LazyStubs stays empty: unresolved imports are bound to ret-0
-    // trampolines above in both modes, so WindowsPePatcher.writeGotStub has
-    // nothing to patch. The field is retained for API compatibility.
+    const auto tlsResolver = guestStartup.EmitTlsResolver(code);
+    for (const auto offset : tlsResolverAddresses) code.PatchBranch(offset, tlsResolver);
 
     // Shared unresolved-import stub (emulator-style, cf. Kyty's
     // UnresolvedImportStub). Entered with the unique-NID index in ecx via a
@@ -459,6 +485,10 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     }
     for (const auto& [offset, uid] : stubLeaFixups)
         code.PatchBranch(offset, stubTrampolines.at(uid));
+    // Lazy unresolved imports are file-patched to the same ret-0 trampolines
+    // (instead of upstream's fail stubs), so both modes stay consistent.
+    for (const auto& [importIndex, uid] : lazyStubFixups)
+        result.LazyStubs.push_back({imports[importIndex].TargetRva, stubTrampolines.at(uid)});
 
     Io::WriteU32(data, functionTable - dataRva, result.Code.Rva);
     Io::WriteU32(data, functionTable - dataRva + 4, functionEnd);

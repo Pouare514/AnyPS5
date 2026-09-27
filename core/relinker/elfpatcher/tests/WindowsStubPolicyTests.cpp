@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <elfpatcher/windows/WindowsEntryStubBuilder.hpp>
+#include <elfpatcher/windows/WindowsPeFormat.hpp>
 #include <elfpatcher/windows/WindowsPeWriter.hpp>
 #include <elfpatcher/windows/WindowsImportBuilder.hpp>
 #include <io/BufferUtils.hpp>
@@ -58,8 +59,15 @@ void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, co
     auto entry = WindowsEntryStubBuilder().Build(dataRva, 0, nativeImports, {"KERNEL32.dll"}, slots, runPath, lazyBinding, false);
     if (entry.ExceptionDirectory.Size != 24)
         throw std::runtime_error("Stub policy bootstrap must register exactly two unwind entries");
-    if (!entry.LazyStubs.empty())
-        throw std::runtime_error("Stub policy must not emit lazy fail stubs (ret-0 in both modes)");
+    // In lazy mode every import is recorded for file-patching (resolvable
+    // ones are simply re-resolved at boot, overwriting the patch).
+    const std::size_t expectedLazy = lazyBinding ? imports.size() : 0;
+    if (!lazyBinding) {
+        if (!entry.LazyStubs.empty())
+            throw std::runtime_error("Eager stub policy must bind directly (no LazyStubs)");
+    } else if (entry.LazyStubs.size() != expectedLazy) {
+        throw std::runtime_error("Lazy stub policy must file-patch one GOT slot per import");
+    }
 
     // Fake ELF entry: when stubSlot is valid, call that GOT slot twice, int3
     // if the first call did not return 0 (proves the stub returns 0 with any
@@ -89,8 +97,12 @@ void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, co
     auto retry = WindowsEntryStubBuilder().Build(dataRva, fakeRva, nativeImports, {"KERNEL32.dll"}, slots, runPath, lazyBinding, false);
     if (retry.ExceptionDirectory.Size != 24)
         throw std::runtime_error("Stub policy bootstrap must register exactly two unwind entries");
-    if (!retry.LazyStubs.empty())
-        throw std::runtime_error("Stub policy must not emit lazy fail stubs (ret-0 in both modes)");
+    if (!lazyBinding) {
+        if (!retry.LazyStubs.empty())
+            throw std::runtime_error("Eager stub policy must bind directly (no LazyStubs)");
+    } else if (retry.LazyStubs.size() != expectedLazy) {
+        throw std::runtime_error("Lazy stub policy must file-patch one GOT slot per import");
+    }
 
     std::array<PeDirectory, 16> directories{};
     directories[1] = nativeImports.Directory;
@@ -102,6 +114,23 @@ void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, co
     sections.push_back(std::move(retry.Data));
     sections.push_back(std::move(retry.Code));
     sections.push_back(std::move(fakeEntry));
+    // Lazy mode leaves GOT slots zero at boot; file-patch them to the shared
+    // ret-0 trampolines exactly like WindowsPePatcher::writeGotStub does, so
+    // the runner executes the same image the real patcher would emit.
+    for (const auto& lazy : retry.LazyStubs) {
+        bool patched = false;
+        for (auto& section : sections) {
+            if (lazy.TargetRva >= section.Rva &&
+                lazy.TargetRva - section.Rva <= section.Data.size() - 8) {
+                Io::WriteU64(section.Data, lazy.TargetRva - section.Rva,
+                             ImageBase + lazy.StubRva);
+                patched = true;
+                break;
+            }
+        }
+        if (!patched)
+            throw std::runtime_error("Lazy GOT slot is not contained in any section");
+    }
     writeFile(path, WindowsPeWriter().Write(sections, sections[3].Rva, directories));
 }
 

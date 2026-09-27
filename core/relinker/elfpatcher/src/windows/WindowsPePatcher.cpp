@@ -1,5 +1,6 @@
 #include <elfpatcher/windows/WindowsElfPatcher.hpp>
 #include <elfpatcher/windows/WindowsEntryStubBuilder.hpp>
+#include <elfpatcher/windows/WindowsPeFormat.hpp>
 #include <elfpatcher/windows/WindowsLoadImage.hpp>
 #include <elfpatcher/windows/WindowsPeWriter.hpp>
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
@@ -29,9 +30,12 @@ void writeDiagnosticsImports(const std::vector<PeImport>& imports) {
 
 void writeGotStub(std::vector<PeSection>& sections, const std::uint32_t targetRva, const std::uint32_t stubRva) {
     for (auto& section : sections) {
-        if (targetRva < section.Rva || targetRva - section.Rva > section.Data.size() - 4)
+        if (targetRva < section.Rva || targetRva - section.Rva > section.Data.size() - 8)
             continue;
-        Io::WriteU32(section.Data, targetRva - section.Rva, stubRva);
+        // GOT slots hold absolute addresses: the image loads at ImageBase, so
+        // the (RVA, RVA) pair must be rebased. A raw-RVA write would jump into
+        // unmapped low memory on first call.
+        Io::WriteU64(section.Data, targetRva - section.Rva, ImageBase + stubRva);
         return;
     }
     throw Domain::RelinkerException("Lazy import GOT slot is not contained in any section", targetRva);
@@ -78,10 +82,17 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     directories[1] = nativeImports.Directory;
     directories[12] = nativeImports.AddressTable;
     nextRva = AlignRva(nextRva + nativeImports.Section.Data.size());
-    const auto libraries = importBuilder.ReadLibraries(dynamicSection);
+    auto libraries = importBuilder.ReadLibraries(dynamicSection);
+    std::vector<std::string> guestPaths;
+    for (std::size_t index = 0; index < dynamicSection.GuestModules.size(); ++index) {
+        const auto& module = dynamicSection.GuestModules[index];
+        guestPaths.push_back(module.Path);
+        for (const auto& import : module.Imports) relocations.Imports.push_back({import.Name, import.TargetRva, import.Addend, static_cast<std::int32_t>(index), import.RelocationType});
+    }
+    libraries.insert(libraries.begin(), guestPaths.begin(), guestPaths.end());
     if (dependencyDiagnostics)
         writeDiagnosticsImports(relocations.Imports);
-    auto entry = WindowsEntryStubBuilder().Build(nextRva, image.GetEntryRva(), nativeImports, libraries, relocations.Imports, runPath, lazyBinding, dependencyDiagnostics);
+    auto entry = WindowsEntryStubBuilder().Build(nextRva, image.GetEntryRva(), nativeImports, libraries, relocations.Imports, runPath, lazyBinding, dependencyDiagnostics, dynamicSection.GuestModules);
     directories[3] = entry.ExceptionDirectory;
     const auto entryRva = entry.Code.Rva;
     sections.push_back(std::move(nativeImports.Section));
