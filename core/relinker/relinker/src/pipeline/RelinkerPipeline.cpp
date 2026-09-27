@@ -283,6 +283,13 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
                 continue;
             }
 
+            if (symIdx == 0) {
+                // Static (module-local) relocation, e.g. DTPMOD64/TLS fixups in
+                // libc with no symbol attached. These are not NID imports; they
+                // are preserved verbatim into the output RELA table below.
+                continue;
+            }
+
             const FileByteOffset symOff = dynSymTabOffset + static_cast<FileByteOffset>(symIdx) * symEntSize;
             if (symOff + 4 > raw.size())
                 throw RelinkerException("Symbol table entry out of bounds", symOff);
@@ -393,8 +400,6 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     }
     auto dynSection = _dynamicSectionBuilder->BuildDynamicSection(dynamicRefs, neededLibraries, dynJmpRelOffset, pltCount);
 
-    static constexpr std::uint32_t R_X86_64_RELATIVE = 8;
-
     auto appendRela = [&](std::vector<std::uint8_t>& buf, std::uint64_t offset, std::uint64_t info, std::int64_t addend) {
         std::size_t pos = buf.size();
         buf.resize(pos + 24);
@@ -403,7 +408,7 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
         std::memcpy(buf.data() + pos + 16, &addend, 8);
     };
 
-    auto extractRelative = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
+    auto extractStaticRelocs = [&](const FileByteOffset relaOff, const ByteCount relaSize) {
         for (ByteCount off = 0; off + relaEntSize <= relaSize; off += relaEntSize) {
             const FileByteOffset pos = relaOff + off;
             std::uint64_t rOffset = 0, rInfo = 0;
@@ -412,14 +417,15 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
             std::memcpy(&rInfo, raw.data() + pos + 8, 8);
             std::memcpy(&rAddend, raw.data() + pos + 16, 8);
             const std::uint32_t symIdx = static_cast<std::uint32_t>(rInfo >> 32);
-            const std::uint32_t relType = static_cast<std::uint32_t>(rInfo & 0xffffffff);
-            if (symIdx == 0 && relType == R_X86_64_RELATIVE)
-                appendRela(dynSection.RelaData, rOffset, static_cast<std::uint64_t>(R_X86_64_RELATIVE), rAddend);
+            // Every symbol-less entry (RELATIVE plus static TLS etc.) is
+            // carried over verbatim; only symbol-backed entries become imports.
+            if (symIdx == 0)
+                appendRela(dynSection.RelaData, rOffset, rInfo, rAddend);
         }
     };
 
-    extractRelative(dynRelaOffset, dynRelaSize);
-    extractRelative(dynJmpRelOffset, dynJmpRelSize);
+    extractStaticRelocs(dynRelaOffset, dynRelaSize);
+    extractStaticRelocs(dynJmpRelOffset, dynJmpRelSize);
 
     std::vector<CallRegistryEntry> entries;
     entries.reserve(nidRefs.size());

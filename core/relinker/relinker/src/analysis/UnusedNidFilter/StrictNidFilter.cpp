@@ -175,7 +175,15 @@ private:
 class StrictNidFilter : public IUnusedNidFilter {
 public:
     std::vector<NidReference> Filter(const std::vector<NidReference>& nidRefs, const std::vector<std::uint8_t>& elfBytes, const std::vector<std::uint8_t>& textSection, VirtualAddress textVAddr) override {
-        const StrictImage image(elfBytes);
+        // Accept SELF containers by unwrapping first so raw offsets stay consistent
+        // with the (auto-unwrapping) ElfReader used by StrictImage.
+        std::vector<std::uint8_t> unwrapped;
+        const std::vector<std::uint8_t>* bytesPtr = &elfBytes;
+        if (ElfReader::IsSelfImage(elfBytes)) {
+            unwrapped = ElfReader::UnwrapSelfImage(elfBytes);
+            bytesPtr = &unwrapped;
+        }
+        const StrictImage image(*bytesPtr);
         const auto input = image.Build(nidRefs, textSection, textVAddr);
         const auto analysis = UnusedNidFilter::AnalyzeStrictReachability(input);
         std::vector<NidReference> result;
