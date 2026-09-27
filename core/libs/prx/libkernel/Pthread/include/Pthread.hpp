@@ -31,6 +31,20 @@ struct PthreadMutexPrivate {
     PthreadMutexPrivate() : _type(MutexType::Normal), _count(0) {}
 };
 
+struct PthreadRwlockattrPrivate {
+    int _type = 0;
+    int _pshared = 0;
+};
+
+struct PthreadRwlockPrivate {
+    std::mutex _mtx;
+    std::condition_variable _cv;
+    int _readers = 0;
+    bool _writer = false;
+    std::thread::id _writerTid;
+    int _writerRecursion = 0;
+};
+
 struct PthreadCondattrPrivate {
     int _clockid;
 };
