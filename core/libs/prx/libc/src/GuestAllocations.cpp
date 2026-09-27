@@ -4,6 +4,7 @@
 #include <iterator>
 #include <map>
 #include <stdexcept>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -191,6 +192,58 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
     std::erase_if(registry().ranges, [&](const auto& entry) { return entry.second->allocationAddress == range.address; });
+}
+
+// In-place claim for Windows 16K-fixed mappings inside already-committed 64K views:
+// VirtualProtect works at 4K granularity (no new views, no 64K alignment issue).
+// Allows holes (untracked but host-committed pages); trims overlapping entries
+// preserving prefix/suffix with their original identity, then Adds [pointer,bytes).
+// Conservative: PROT_NONE covering or identical r/w allowed; differing protections
+// with writable involved throw (never silently alias different writable views).
+void GuestAllocationsClaimInPlace_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, const std::function<void()>& apply) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid fixed guest mapping");
+    require(!writable || readable, "writable guest allocation must be readable");
+    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    const auto end = address + bytes;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const Range>>> overlapping;
+    for (const auto& [base, entry] : registry().ranges) {
+        const auto finish = base + entry->bytes;
+        if (finish <= address) continue;
+        if (base >= end) break;
+        overlapping.emplace_back(base, entry);
+    }
+    for (const auto& [base, entry] : overlapping) {
+        const auto& range = *entry;
+        if (!range.releasable) require(false, "fixed mapping overlaps a registered guest allocation");
+        const bool oldReadable = range.readable;
+        const bool oldWritable = range.writable;
+        if (!oldReadable && !oldWritable) continue;
+        if (oldReadable == readable && oldWritable == writable) continue;
+        if (oldWritable || writable) throw std::runtime_error("in-place mapping would alias different protections over shared backing");
+    }
+    auto replacement = registry().ranges;
+    for (const auto& [base, entry] : overlapping) {
+        const auto& range = *entry;
+        const auto finish = base + range.bytes;
+        replacement.erase(base);
+        const auto insert = [&](std::uint64_t first, std::uint64_t last) {
+            if (first < last) replacement.emplace(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(last - first), range.readable, range.writable, range.allocationAddress, range.allocationBytes, range.releasable}));
+        };
+        insert(base, std::max(base, address));
+        insert(std::min(finish, end), finish);
+    }
+    {
+        const auto next = replacement.lower_bound(address);
+        require(next == replacement.end() || (next->first != address && address + bytes <= next->first), "overlapping guest allocation");
+        if (next != replacement.begin()) {
+            const auto& previous = *std::prev(next)->second;
+            require(previous.address + previous.bytes <= address, "overlapping guest allocation");
+        }
+        replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes}));
+    }
+    apply();
+    registry().ranges.swap(replacement);
 }
 
 namespace {

@@ -185,6 +185,52 @@ bool ReserveAndReuseFixedMapping(GuestAllocations::Mutation& mutation, void* add
 }
 #endif
 
+#ifdef _WIN32
+// In-place reprotect for PS5 16K-fixed mappings inside already-committed host views:
+// VirtualQuery(addr) — if [addr,len) is fully MEM_COMMIT (MEM_MAPPED, no guard),
+// just VirtualProtect it (4K granularity, no new views, no 64K alignment issue) +
+// registry surgery (ClaimInPlace: trim overlapping entries, Add). Returns true when
+// handled; false when NOT backed (fall through to Reuse/Reserve/Map). Throws on
+// ambiguity (different protections with writable involved) — conservative, like Reuse.
+bool TryReprotectInPlaceMapping(GuestAllocations::Mutation& mutation, void* addr, size_t len,
+                                int sceProt, int posixProt, int flags, size_t alignment) {
+    if (addr == nullptr) return false;
+    ValidateLength(len);
+    const size_t validatedAlignment = ValidateAlignment(alignment);
+    constexpr int guestMapFixed = 0x10;
+    constexpr int guestMapNoCoalesce = 0x400000;
+    if ((flags & ~(guestMapFixed | guestMapNoCoalesce)) != 0) throw std::invalid_argument("Unsupported memory mapping flags");
+    if ((flags & guestMapFixed) == 0) throw std::invalid_argument("Non-fixed mapping address hints are not implemented");
+    ValidateRange(addr, len, validatedAlignment);
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    const auto limit = std::numeric_limits<std::uintptr_t>::max();
+    if (len > limit - start) return false;
+    const auto end = start + len;
+    auto cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (memory.State != MEM_COMMIT) return false;
+        if (memory.Type != MEM_MAPPED) return false;
+        if ((memory.Protect & PAGE_GUARD) != 0) return false;
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        const auto regionSize = static_cast<std::uintptr_t>(memory.RegionSize);
+        if (regionSize == 0 || base > cursor || regionSize > limit - base) return false;
+        const auto regionEnd = base + regionSize;
+        if (regionEnd <= cursor) return false;
+        cursor = regionEnd < end ? regionEnd : end;
+    }
+    const bool readable = (sceProt & 3) != 0;
+    const bool writable = (sceProt & 2) != 0;
+    mutation.ClaimInPlace(addr, len, readable, writable, [&] {
+        DWORD old = 0;
+        if (!VirtualProtect(addr, len, WinProtFromPosix(posixProt), &old))
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualProtect failed");
+    });
+    return true;
+}
+#endif
+
 void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {    ValidateLength(len);
     alignment = ValidateAlignment(alignment);
     constexpr int guestMapFixed = 0x10;
@@ -213,7 +259,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     GuestAllocations::Mutation mutation;
     if (*addr != nullptr) {
         const int posixProt = LinuxProtFromSce(prot);
-        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)
+        if (
+#ifdef _WIN32
+            !TryReprotectInPlaceMapping(mutation, *addr, len, prot, posixProt, flags, alignment) &&
+#endif
+            !ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)
 #ifdef _WIN32
             && !ReserveAndReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)
 #endif
@@ -247,7 +297,11 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     GuestAllocations::Mutation mutation;
     if (*addr != nullptr) {
         const int posixProt = LinuxProtFromSce(prot);
-        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE)
+        if (
+#ifdef _WIN32
+            !TryReprotectInPlaceMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE) &&
+#endif
+            !ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE)
 #ifdef _WIN32
             && !ReserveAndReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags,
                                             PS5_PAGE_SIZE)
