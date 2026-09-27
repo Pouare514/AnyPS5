@@ -209,4 +209,8 @@ void APS5_VABI qsort_nid_postfix(void* base, size_t count, size_t size, int (APS
     }
 }
 
+void* APS5_VABI aligned_alloc_nid_postfix(size_t alignment, size_t bytes) {
+    return ApplicationHeapAlign_nid_no_patch(alignment, bytes);
+}
+
 }
