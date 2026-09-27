@@ -131,12 +131,20 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
         relocations.push_back(CheckedRva(data.Rva + offset));
     };
 
+    // Windows TLS semantics: [Start, End) is the initialized template
+    // (FileSize bytes copied from the image), SizeOfZeroFill covers the
+    // remaining tbss + alignment padding + thread-control block. For
+    // tbss-only segments (FileSize == 0, e.g. Legends 0/0x58) End == Start
+    // and the whole block is zero-filled. Previously End claimed
+    // blockSize + 16 raw bytes with ZeroFill == 0, overstating initialized
+    // data for tbss-only/small TLS.
     writeAddress(0, templateRva);
-    writeAddress(8, CheckedRva(templateRva + blockSize + 16));
+    writeAddress(8, CheckedRva(templateRva + tls->FileSize));
     writeAddress(16, indexRva);
     writeAddress(24, callbackTableRva);
     writeAddress(48, codeRva);
 
+    Io::WriteU32(data.Data, 32, CheckedRva(static_cast<std::uint64_t>(blockSize) + 16 - tls->FileSize));
     Io::WriteU32(data.Data, 36, static_cast<std::uint32_t>(std::bit_width(alignment)) << 20);
     const PeDirectory directory{data.Rva, 40};
     sections.push_back(std::move(data));
