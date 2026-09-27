@@ -1,4 +1,5 @@
 #include "relinker/analysis//ValidationPolicy.hpp"
+#include <iostream>
 #include <sstream>
 
 namespace Relinker {
@@ -132,10 +133,14 @@ void ValidationPolicy::ValidateNidBelongsToLibrary(const std::string& Nid, const
             return;
     }
     {
+        // Verneed entries may reference version-only libraries (e.g. libSceCoredump)
+        // that never appear in DT_NEEDED. That is legal input, not an error: warn and
+        // let downstream resolution (stubs/diagnostics) handle the NID.
         std::ostringstream msg;
-        msg << "NID \"" << Nid << "\" references library \"" << library
-            << "\" which is not in the NEEDED list";
-        throw RelinkerException(msg.str(), 0);
+        msg << "warning: NID \"" << Nid << "\" references library \"" << library
+            << "\" which is not in the NEEDED list; continuing";
+        std::cerr << msg.str() << std::endl;
+        return;
     }
 }
 
