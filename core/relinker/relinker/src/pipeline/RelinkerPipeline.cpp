@@ -199,6 +199,11 @@ RelinkResult RelinkerPipeline::Relink(const std::vector<std::uint8_t>& sourceElf
     for (const auto& ref : nidRefs)
         _validationPolicy->ValidateRelocationTypeSupported(ref.RelocationTypeValue, ref.RelocationTableOffset);
 
+    for (const auto& ref : nidRefs) {
+        if (!ref.Library.empty())
+            _validationPolicy->ValidateNidBelongsToLibrary(ref.Nid, ref.Library);
+    }
+
     if (!textSection.empty())
         _syscallScanner->ScanCodeSectionForSyscalls(textSection, textVAddr, textSection.size());
 
