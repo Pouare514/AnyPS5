@@ -72,6 +72,7 @@ struct PthreadPrivate {
 #endif
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
+    char name[32] = {};
     std::atomic<bool> _finished;
     void* _retval;
     bool _detached;

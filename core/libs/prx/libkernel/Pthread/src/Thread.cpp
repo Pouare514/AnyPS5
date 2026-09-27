@@ -230,9 +230,9 @@ int APS5_VABI scePthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 }
 
 int APS5_VABI scePthreadGetname(Pthread thread, char* name) {
- (void)thread;
- (void)name;
- NotImplemented_nid_no_patch(__func__);
+ if (thread == nullptr || name == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+ std::strncpy(name, thread->name, sizeof(thread->name) - 1);
+ name[sizeof(thread->name) - 1] = '\0';
  return 0;
 }
 
@@ -249,9 +249,10 @@ int APS5_VABI scePthreadGetthreadid(void) {
 }
 
 int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
- (void)thread;
- (void)name;
- NotImplemented_nid_no_patch(__func__);
+ if (thread == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+ if (name == nullptr) return 0;
+ std::strncpy(thread->name, name, sizeof(thread->name) - 1);
+ thread->name[sizeof(thread->name) - 1] = '\0';
  return 0;
 }
 
