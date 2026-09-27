@@ -17,6 +17,17 @@
 // Note: UOUpNbLHx2g is imported without PLT, but its kind is still Func, so
 // it is stubbed as a function like the others (a function address satisfies
 // both call and address-taken imports).
+//
+// Runtime note (no full-game run yet): which video stub runs first is still
+// unknown because the NIDs are obfuscated. By import kind, UOUpNbLHx2g
+// (Func/non-PLT, address-taken) is bound at module load, before any PLT call
+// resolves lazily, so it is the first one the loader touches. The first
+// actual video *call* will be the first "Bink2PS5 stub <NID> called" line in
+// the log (every stub below logs via APS5_LOG_ERR); update this comment once
+// a boot is observed. The game may not reach video at all until the other
+// missing Legends libs land (fmod/cohtml/renoir live on sibling prx
+// branches), and every stub here returns 0, so video will be skipped/black
+// rather than decoded.
 #include <cstdint>
 #include <cstdio>
 #include "prx/libc/include/General.hpp"
