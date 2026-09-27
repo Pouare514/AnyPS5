@@ -738,11 +738,40 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const auto& mem = access.mem;
     const auto dimension = access.image.dimension;
     if (dimension == RdnaImageDimension::Dim1D) {
-        if (setup.dref || !HasFlag(mem, RdnaImageSampleFlagLevelZero) || HasFlag(mem, RdnaImageSampleFlagOffset) || HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
+        // Reachability: IMAGE_GATHER4_C / GATHER_C_LZ[_O] on a 1D image (guest Color1D) with the
+        // Compare flag set. That requires a 1D depth texture sampled with depth comparison; with
+        // indirect it additionally requires a bindless heap (image.indirectRoot != resource)
+        // holding 1D depth candidates. 1D depth has no practical backing (shadow maps are 2D)
+        // and no known title uses it, so this path is effectively unreachable, but Dref is now
+        // emulated like the 2D path instead of failing. 1D-array gather stays unsupported.
+        if (!HasFlag(mem, RdnaImageSampleFlagLevelZero) || HasFlag(mem, RdnaImageSampleFlagOffset) || HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
             ctx.Fail(access.inst, "has an unsupported 1D gather variant");
         }
+        const bool aluCompare =
+            setup.dref && setup.numericClass == IrTextureNumericClass::Float &&
+            ImageUsesAluDepthCompare(state, mem);
         const auto sample = EmitOneDimensionalGatherLz(ctx, access, setup.coord);
-        ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, sample), setup.numericClass, false, true));
+        auto gathered = sample;
+        if (aluCompare) {
+            auto drefValue = ZeroF32(state);
+            if (setup.layout.dref != NoImageComponent && mem.imageAddressComponents > setup.layout.dref) {
+                drefValue = AddressF32(ctx, access, setup.layout.dref);
+            }
+            const auto compareFunc = SamplerCompareFunc(state, mem);
+            std::uint32_t lanes[4] = {};
+            for (std::uint32_t lane = 0; lane < 4u; lane++) {
+                const auto texel = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), texel, sample, lane);
+                lanes[lane] = EmitAluDepthCompareF32(state, texel, drefValue, compareFunc);
+            }
+            gathered = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), gathered, lanes[0], lanes[1], lanes[2], lanes[3]);
+        }
+        auto resultNumericClass = setup.numericClass;
+        if (setup.dref) {
+            resultNumericClass = IrTextureNumericClass::Float;
+        }
+        ctx.Define(access.inst, ResultVector(ctx, access, UnpackImageGather(ctx, access, gathered), resultNumericClass, false, true));
         return;
     }
     if (dimension == RdnaImageDimension::Dim1DArray) {
@@ -866,7 +895,11 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const auto emitSample = [&](std::uint32_t resource) {
         auto coord = setup.coord;
         // Recompute per-candidate so unnormalized normalization uses the candidate shape.
-        // Keep the precomputed coord when cube differs to preserve existing cube handling.
+        // Cube coords are direction vectors (CubeAxis/CubeLayer), not texel UV, so texel-size
+        // normalization does not apply (skipped below via !candidate.cube). Mixed cube/non-cube
+        // candidates for one shader would be a descriptor-type mismatch and does not occur in
+        // valid bindless heaps; keeping the precomputed (base-cube) coord in that unreachable
+        // case preserves the existing cube path instead of emitting mismatched CubeAxis logic.
         const auto& candidate = state.program.Info().images.at(resource);
         if (candidate.cube == access.image.cube) {
             const auto candidateComponents = RdnaImageDimensionInfoFor(candidate.dimension).coordinateComponents;
