@@ -84,6 +84,16 @@ int APS5_VABI sceNetGetsockname(int s, void* addr, uint32_t* addrlen) {
  return 0;
 }
 
+int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
+ (void)s;
+ (void)level;
+ (void)optname;
+ (void)optval;
+ (void)optlen;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 uint32_t APS5_VABI sceNetHtonl_nid_postfix(uint32_t host32) {
  (void)host32;
  NotImplemented_nid_no_patch(__func__);
