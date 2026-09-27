@@ -7,6 +7,21 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
 
+struct SystemServicePlayerDialogParam {
+ uint64_t unknown0;
+ uint32_t unknown1;
+ uint32_t unknown2;
+ uint64_t unknown3;
+ uint64_t unknown4;
+ uint64_t unknown5;
+ uint64_t unknown6;
+ uint64_t unknown7;
+ uint64_t unknown8;
+ uint64_t unknown9;
+};
+
+static_assert(sizeof(SystemServicePlayerDialogParam) == 0x48);
+
 extern "C" {
 
 int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
@@ -102,6 +117,22 @@ int APS5_VABI sceSystemServiceReportAbnormalTermination(const void* info) {
 int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
+}
+
+void APS5_VABI sceSystemServiceInitializePlayerDialogParam(SystemServicePlayerDialogParam* param) {
+ if (param == nullptr) {
+  return;
+ }
+ std::memset(param, 0, sizeof(*param));
+ param->unknown0 = 0x48;
+ param->unknown2 = 0xFFFFFFFFu;
+}
+
+int APS5_VABI sceSystemServiceLaunchPlayerDialog(const SystemServicePlayerDialogParam* param) {
+ if (param == nullptr || param->unknown2 == 0) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ return SYSTEM_SERVICE_OK;
 }
 
 }

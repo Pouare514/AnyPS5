@@ -5,6 +5,26 @@
 
 extern "C" {
 
+int APS5_VABI sceSslConnect(int conn_id) {
+ (void)conn_id;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSslCreateConnection(int ssl_ctx_id, int sock_fd, void* opt) {
+ (void)ssl_ctx_id;
+ (void)sock_fd;
+ (void)opt;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSslDeleteConnection(int conn_id) {
+ (void)conn_id;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceSslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
  (void)ssl_ctx_id;
  (void)ca_certs;
@@ -25,8 +45,24 @@ int APS5_VABI sceSslInit_nid_postfix(uint64_t pool_size) {
  return 0;
 }
 
+int APS5_VABI sceSslRead(int conn_id, void* buf, size_t len) {
+ (void)conn_id;
+ (void)buf;
+ (void)len;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceSslTerm_nid_postfix(int ssl_ctx_id) {
  (void)ssl_ctx_id;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSslWrite(int conn_id, const void* buf, size_t len) {
+ (void)conn_id;
+ (void)buf;
+ (void)len;
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
