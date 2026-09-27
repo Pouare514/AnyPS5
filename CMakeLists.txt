@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(Relinker CXX)
 
+# Default to Release when no build type is given. Required because
+# 3rdparty/glslang forces CMAKE_BUILD_TYPE=Debug in its own scope when the
+# parent has none, while setting CMAKE_DEBUG_POSTFIX=d on Windows. The parent
+# scope then expects 3rdparty/glslang/SPIRV/libSPIRV.a but glslang actually
+# builds libSPIRVd.a, so the `libs` aggregate target fails in ninja with
+# "missing and no known rule to make it". Release has no postfix in either
+# scope, so both agree (matches the working main-branch configuration).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(BUILD_TESTING "Build and register relinker tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
