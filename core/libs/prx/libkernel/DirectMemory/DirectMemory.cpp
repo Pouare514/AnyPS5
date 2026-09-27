@@ -76,6 +76,83 @@ void Unmap(void* addr, size_t len) {
     GuestMemoryBacking::GuestMemoryBackingUnmap_nid_postfix(addr, len);
 }
 
+bool ReuseFixedMapping(GuestAllocations::Mutation& mutation, void* addr, size_t len, int sceProt, int posixProt, int flags, size_t alignment) {
+    if (addr == nullptr) return false;
+    GuestAllocations::Range covering{};
+    if (!mutation.FindCoveringReservation(addr, len, &covering)) return false;
+    ValidateLength(len);
+    const size_t validatedAlignment = ValidateAlignment(alignment);
+    constexpr int guestMapFixed = 0x10;
+    constexpr int guestMapNoCoalesce = 0x400000;
+    if ((flags & ~(guestMapFixed | guestMapNoCoalesce)) != 0) throw std::invalid_argument("Unsupported memory mapping flags");
+    if ((flags & guestMapFixed) == 0) throw std::invalid_argument("Non-fixed mapping address hints are not implemented");
+    ValidateRange(addr, len, validatedAlignment);
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    const auto base = covering.address;
+    const auto size = covering.bytes;
+    if (base > start || start + len > base + size) throw std::runtime_error("covering reservation mismatch");
+    if ((size & (PS5_PAGE_SIZE - 1)) != 0) throw std::runtime_error("covering reservation size mismatch");
+    void* wholeAddr = reinterpret_cast<void*>(base);
+    mutation.Unmap(wholeAddr, size, [](const void*, bool) {});
+    void* prefixAddr = nullptr;
+    size_t prefixLen = 0;
+    void* suffixAddr = nullptr;
+    size_t suffixLen = 0;
+    if (start > base) {
+        prefixAddr = reinterpret_cast<void*>(base);
+        prefixLen = static_cast<size_t>(start - base);
+    }
+    if (start + len < base + size) {
+        suffixAddr = reinterpret_cast<void*>(start + len);
+        suffixLen = static_cast<size_t>(base + size - (start + len));
+    }
+    const bool readable = (sceProt & 3) != 0;
+    const bool writable = (sceProt & 2) != 0;
+    bool addedPrefix = false;
+    bool addedMapped = false;
+    bool addedSuffix = false;
+    try {
+        if (prefixLen != 0) {
+            mutation.Add(prefixAddr, prefixLen, false, false);
+            addedPrefix = true;
+        }
+        mutation.Add(addr, len, readable, writable);
+        addedMapped = true;
+        if (suffixLen != 0) {
+            mutation.Add(suffixAddr, suffixLen, false, false);
+            addedSuffix = true;
+        }
+    } catch (...) {
+        try {
+            if (addedSuffix) mutation.Remove(suffixAddr);
+            if (addedMapped) mutation.Remove(addr);
+            if (addedPrefix) mutation.Remove(prefixAddr);
+        } catch (...) {
+        }
+        try {
+            mutation.Add(wholeAddr, size, false, false);
+        } catch (...) {
+        }
+        throw;
+    }
+    try {
+        GuestMemoryBacking::GuestMemoryBackingReuse_nid_postfix(addr, len, posixProt);
+    } catch (...) {
+        try {
+            if (suffixLen != 0) mutation.Remove(suffixAddr);
+            mutation.Remove(addr);
+            if (prefixLen != 0) mutation.Remove(prefixAddr);
+        } catch (...) {
+        }
+        try {
+            mutation.Add(wholeAddr, size, false, false);
+        } catch (...) {
+        }
+        throw;
+    }
+    return true;
+}
+
 void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateLength(len);
     alignment = ValidateAlignment(alignment);
@@ -103,8 +180,22 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         return SCE_KERNEL_ERROR_EINVAL;
     }
     GuestAllocations::Mutation mutation;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
-    void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
+    if (*addr != nullptr) {
+        const int posixProt = LinuxProtFromSce(prot);
+        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, alignment)) {
+            mutation.RequireAvailable(*addr, len);
+            void* mapped = MapAligned(*addr, len, posixProt, flags, alignment);
+            try {
+                mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
+            } catch (...) {
+                Unmap(mapped, len);
+                throw;
+            }
+            *addr = mapped;
+        }
+        return 0;
+    }
+    void* mapped = MapAligned(nullptr, len, LinuxProtFromSce(prot), flags, alignment);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
     } catch (...) {
@@ -119,8 +210,22 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
-    void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
+    if (*addr != nullptr) {
+        const int posixProt = LinuxProtFromSce(prot);
+        if (!ReuseFixedMapping(mutation, *addr, len, prot, posixProt, flags, PS5_PAGE_SIZE)) {
+            mutation.RequireAvailable(*addr, len);
+            void* mapped = MapAligned(*addr, len, posixProt, flags, PS5_PAGE_SIZE);
+            try {
+                mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
+            } catch (...) {
+                Unmap(mapped, len);
+                throw;
+            }
+            *addr = mapped;
+        }
+        return 0;
+    }
+    void* mapped = MapAligned(nullptr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
     } catch (...) {

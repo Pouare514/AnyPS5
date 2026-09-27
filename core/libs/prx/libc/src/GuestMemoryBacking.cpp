@@ -93,4 +93,20 @@ void GuestMemoryBackingWrite_nid_postfix(std::uint64_t address, const void* sour
     std::memcpy(destination, source, bytes);
 }
 
+void GuestMemoryBackingReuse_nid_postfix(void* pointer, std::size_t bytes, int protection) {
+    const auto pageSize = GuestMemoryTracking::GuestMemoryTrackingPageSize_nid_postfix();
+    if (pointer == nullptr || bytes == 0 || bytes % pageSize != 0 || (protection & ~7) != 0) throw std::invalid_argument("invalid shared guest memory reuse");
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    if (address > std::numeric_limits<std::uint64_t>::max() - bytes) throw std::invalid_argument("invalid guest backing reuse range");
+    std::lock_guard lock(GuestMemoryTracking::GuestMemoryTrackingMutex_nid_postfix());
+    auto found = allocations().upper_bound(address);
+    if (found == allocations().begin()) throw std::runtime_error("guest memory has no shared backing for reuse");
+    auto& allocation = std::prev(found)->second;
+    const auto base = allocation.mapping.address;
+    const auto size = allocation.mapping.bytes;
+    if (address < base || bytes > size - (address - base)) throw std::runtime_error("guest memory reuse range is not within a shared backing");
+    static_cast<void>(find(address, bytes));
+    Platform::Protect(address, bytes, protection);
+}
+
 }

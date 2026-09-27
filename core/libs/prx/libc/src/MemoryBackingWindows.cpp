@@ -69,4 +69,9 @@ void Deactivate(std::uint64_t address, std::size_t bytes) {
     check(VirtualProtect(reinterpret_cast<void*>(address), bytes, PAGE_NOACCESS, &previous) != FALSE, "VirtualProtect guest backing unmap");
 }
 
+void Protect(std::uint64_t address, std::size_t bytes, int protection) {
+    DWORD previous = 0;
+    check(VirtualProtect(reinterpret_cast<void*>(address), bytes, nativeProtection(protection), &previous) != FALSE, "VirtualProtect guest backing reuse");
+}
+
 }
