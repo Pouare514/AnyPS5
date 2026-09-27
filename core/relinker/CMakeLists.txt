@@ -69,6 +69,21 @@ if(WIN32)
         set_target_properties(windows_dependency_diagnostics_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
         add_test(NAME windows_dependency_diagnostics COMMAND windows_dependency_diagnostics_tests)
     endif()
+    add_executable(windows_stub_policy_tests EXCLUDE_FROM_ALL
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsStubPolicyTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsEntryStubBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsDependencyStubBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsStubEmitter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsImportBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsPeWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsPeFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
+    )
+    target_include_directories(windows_stub_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include ${CMAKE_CURRENT_SOURCE_DIR}/domain/include ${CMAKE_CURRENT_SOURCE_DIR}/io/include ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include)
+    if(BUILD_TESTING)
+        set_target_properties(windows_stub_policy_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME windows_stub_policy COMMAND windows_stub_policy_tests)
+    endif()
 endif()
 
 
