@@ -306,7 +306,13 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     // Forward references to the per-NID stub trampolines emitted after the
     // main bootstrap body: {rel32 field offset, unique-NID index}.
     std::vector<std::pair<std::size_t, std::size_t>> stubLeaFixups;
-    std::vector<std::size_t> lazyUnresolvedImports;
+    // Windows lazy binding is aligned to the stub policy (ret-0 stubs) for
+    // partial-boot consistency: both eager and lazy bind unresolved imports
+    // to the shared log-once/return-0 trampolines instead of failing. The
+    // flag is accepted for CLI compatibility (Linux uses it for DF_BIND_NOW)
+    // but has no effect on Windows. See e2e: lazy boot now exits 42 with the
+    // same STUB lines instead of faulting on first call.
+    (void)lazyBinding;
     for (std::size_t index = 0; index < imports.size(); ++index) {
         code.Rip({0x48, 0x8d, 0x1d}, handles);
         code.Rip({0x48, 0x8d, 0x35}, symbolNames[index]);
@@ -319,26 +325,22 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         const auto resolved = code.Branch({0x0f, 0x85});
         code.Emit({0x48, 0x83, 0xc3, 8, 0xff, 0xcd});
         code.Rip({0x0f, 0x85}, search);
-        if (lazyBinding) {
-            lazyUnresolvedImports.push_back(index);
-            const auto skipGotWrite = code.Branch({0xe9});
-            code.PatchBranch(resolved, code.GetRva());
-            if (imports[index].Addend != 0) {
-                code.Emit({0x48, 0xba});
-                code.U64(imports[index].Addend);
-                code.Emit({0x48, 0x01, 0xd0});
-            }
-            code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
-            code.PatchBranch(skipGotWrite, code.GetRva());
-            continue;
-        }
         // Stub policy: the import was not found in any library. Log the NID
         // once (first occurrence), bind the GOT slot to this NID's stub
         // trampoline, and keep booting so one run reveals every missing
         // import. The stub logs on first call (capped) and returns 0, and is
-        // callable with any signature. The addend is intentionally skipped for
-        // stubs: the stub address stands for the symbol value itself, and
-        // adding an addend would point past the trampoline.
+        // callable with any signature.
+        //
+        // R_X86_64_64 nonzero-addend corner: GOT = stub address (addend
+        // intentionally skipped for stubs). The stub address stands for the
+        // symbol value itself; GOT = stub + addend would point past the
+        // 10-byte trampoline into the middle of the jmp/logger and break
+        // callability (the common case: unresolved functions). Resolved
+        // imports still apply GOT = address + addend below. Data pointers
+        // with a nonzero addend therefore read as stub + 0 bias; this keeps
+        // the boot alive so one run reveals every missing NID, at the cost
+        // of a shifted data view for that corner (documented, covered by
+        // the R_X86_64_64 e2e where a called addend-8 stub still returns 0).
         const auto uid = importUid.at(index);
         if (firstImport.at(uid) == index)
             writeString(stubBindMessages.at(uid));
@@ -373,12 +375,9 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     code.PatchBranch(exitCallback, functionEnd);
     code.Emit({0xc3});
 
-    for (const auto index : lazyUnresolvedImports) {
-        const auto stubRva = code.GetRva();
-        writeString(errorRvas.at(3 + index), true);
-        raise(0xc0000139u);
-        result.LazyStubs.push_back({imports[index].TargetRva, stubRva});
-    }
+    // LazyStubs stays empty: unresolved imports are bound to ret-0
+    // trampolines above in both modes, so WindowsPePatcher.writeGotStub has
+    // nothing to patch. The field is retained for API compatibility.
 
     // Shared unresolved-import stub (emulator-style, cf. Kyty's
     // UnresolvedImportStub). Entered with the unique-NID index in ecx via a

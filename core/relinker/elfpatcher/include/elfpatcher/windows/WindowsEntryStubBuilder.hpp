@@ -14,6 +14,9 @@ struct WindowsEntryStub {
     PeSection Data;
     PeSection Code;
     PeDirectory ExceptionDirectory;
+    // Retained for API compatibility; always empty since the stub policy
+    // binds unresolved imports to ret-0 trampolines in both eager and lazy
+    // modes (Windows lazy has no effect, Linux uses DF_BIND_NOW).
     std::vector<WindowsLazyStub> LazyStubs;
 };
 

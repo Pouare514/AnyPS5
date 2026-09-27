@@ -40,7 +40,7 @@ std::size_t countOccurrences(const std::string& haystack, const std::string& nee
 // WindowsEntryStubBuilder. `imports` drives the GOT slots; the fake ELF entry
 // calls the first GOT slot twice (checking the stub returns 0 the first time
 // via int3 on mismatch) and then returns 0.
-void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, const std::size_t stubSlot) {
+void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, const std::size_t stubSlot, const bool lazyBinding = false) {
     auto nativeImports = WindowsImportBuilder().Build(LoadRva);
     const auto gotRva = AlignRva(nativeImports.Section.Data.size() + LoadRva);
     PeSection got{".gotslot", gotRva, SectionRead | SectionWrite | 0x40u, std::vector<std::uint8_t>(imports.size() * 8)};
@@ -55,9 +55,11 @@ void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, co
     std::vector<PeImport> slots;
     for (std::size_t index = 0; index < imports.size(); ++index)
         slots.push_back({imports[index].Name, CheckedRva(gotRva + index * 8), imports[index].Addend});
-    auto entry = WindowsEntryStubBuilder().Build(dataRva, 0, nativeImports, {"KERNEL32.dll"}, slots, runPath, false, false);
+    auto entry = WindowsEntryStubBuilder().Build(dataRva, 0, nativeImports, {"KERNEL32.dll"}, slots, runPath, lazyBinding, false);
     if (entry.ExceptionDirectory.Size != 24)
         throw std::runtime_error("Stub policy bootstrap must register exactly two unwind entries");
+    if (!entry.LazyStubs.empty())
+        throw std::runtime_error("Stub policy must not emit lazy fail stubs (ret-0 in both modes)");
 
     // Fake ELF entry: when stubSlot is valid, call that GOT slot twice, int3
     // if the first call did not return 0 (proves the stub returns 0 with any
@@ -84,9 +86,11 @@ void createRunner(const Fs::path& path, const std::vector<PeImport>& imports, co
     // Rebuild with the real ELF entry point now that its RVA is known. The
     // rebuild is byte-identical to the sizing build except for the entry
     // call target, since emitted code sizes do not depend on RVA values.
-    auto retry = WindowsEntryStubBuilder().Build(dataRva, fakeRva, nativeImports, {"KERNEL32.dll"}, slots, runPath, false, false);
+    auto retry = WindowsEntryStubBuilder().Build(dataRva, fakeRva, nativeImports, {"KERNEL32.dll"}, slots, runPath, lazyBinding, false);
     if (retry.ExceptionDirectory.Size != 24)
         throw std::runtime_error("Stub policy bootstrap must register exactly two unwind entries");
+    if (!retry.LazyStubs.empty())
+        throw std::runtime_error("Stub policy must not emit lazy fail stubs (ret-0 in both modes)");
 
     std::array<PeDirectory, 16> directories{};
     directories[1] = nativeImports.Directory;
@@ -177,6 +181,52 @@ void checkCleanBoot(const Fs::path& directory) {
         throw std::runtime_error("Clean boot must reach the ELF entry point\n" + result.output);
 }
 
+void checkLazyStubbedBoot(const Fs::path& directory) {
+    // Windows lazy binding is aligned to ret-0 stubs: same expectations as
+    // eager, boot proceeds with identical STUB lines instead of faulting.
+    const auto runner = directory / "stub-lazy-runner.exe";
+    const std::vector<PeImport> imports = {
+        {"LoadLibraryExA", 0, 0},
+        {MissingNid, 0, 0},
+        {MissingNid, 0, 0},
+    };
+    createRunner(runner, imports, 1, true);
+    const auto result = runExe(runner);
+    if (result.status != 0)
+        throw std::runtime_error("Lazy stubbed boot died with status " + std::to_string(result.status) + "\n" + result.output);
+    if (result.output.find("FAIL") != std::string::npos)
+        throw std::runtime_error("Lazy stubbed boot must not log FAIL\n" + result.output);
+    if (countOccurrences(result.output, std::string("STUB: unresolved ELF import ") + MissingNid + "\n") != 1)
+        throw std::runtime_error("Lazy missing NID must be logged once at bind time\n" + result.output);
+    if (countOccurrences(result.output, std::string("STUB: called unresolved ELF import ") + MissingNid) != 1)
+        throw std::runtime_error("Lazy stub firing must be logged exactly once for two calls\n" + result.output);
+    if (result.output.find("Transferring control to ELF entry point") == std::string::npos)
+        throw std::runtime_error("Lazy stubbed boot must reach the ELF entry point\n" + result.output);
+}
+
+void checkAddendStubbedBoot(const Fs::path& directory) {
+    // R_X86_64_64 nonzero-addend corner: GOT = stub address (addend skipped
+    // for stubs to preserve callability). A called addend-8 stub must still
+    // return 0 and boot, logging once like the addend-0 case.
+    const auto runner = directory / "stub-addend-runner.exe";
+    const std::vector<PeImport> imports = {
+        {"LoadLibraryExA", 0, 0},
+        {MissingNid, 0, 8},
+    };
+    createRunner(runner, imports, 1);
+    const auto result = runExe(runner);
+    if (result.status != 0)
+        throw std::runtime_error("Addend stubbed boot died with status " + std::to_string(result.status) + "\n" + result.output);
+    if (result.output.find("FAIL") != std::string::npos)
+        throw std::runtime_error("Addend stubbed boot must not log FAIL\n" + result.output);
+    if (countOccurrences(result.output, std::string("STUB: unresolved ELF import ") + MissingNid + "\n") != 1)
+        throw std::runtime_error("Addend missing NID must be logged once at bind time\n" + result.output);
+    if (countOccurrences(result.output, std::string("STUB: called unresolved ELF import ") + MissingNid) != 1)
+        throw std::runtime_error("Addend stub firing must be logged exactly once for two calls\n" + result.output);
+    if (result.output.find("Transferring control to ELF entry point") == std::string::npos)
+        throw std::runtime_error("Addend stubbed boot must reach the ELF entry point\n" + result.output);
+}
+
 }
 
 int main() {
@@ -189,6 +239,8 @@ int main() {
         Fs::create_directories(directory);
         checkStubbedBoot(directory);
         checkCleanBoot(directory);
+        checkLazyStubbedBoot(directory);
+        checkAddendStubbedBoot(directory);
         std::cout << "Windows stub policy machine-code tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
