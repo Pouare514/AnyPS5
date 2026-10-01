@@ -53,6 +53,10 @@ int APS5_VABI sceNpSessionSignalingGetConnectionStatus(void) {
     return SCE_NP_SESSION_SIGNALING_ERROR_UNAVAILABLE;
 }
 
+int APS5_VABI sceNpSessionSignalingGetConnectionFromPeerAddress2(void) {
+    return SCE_NP_SESSION_SIGNALING_ERROR_UNAVAILABLE;
+}
+
 int APS5_VABI sceNpSessionSignalingTerminate(void) {
     return 0;
 }

@@ -1541,7 +1541,8 @@ struct JpegEncOutputInfo {
 };
 
 struct PlayGoInitParams {
-    const void* buf_addr;    std::uint32_t buf_size;
+    const void* buf_addr;
+    std::uint32_t buf_size;
     std::uint32_t reserved;
 };
 
