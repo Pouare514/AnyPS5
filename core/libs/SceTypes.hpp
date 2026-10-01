@@ -1541,8 +1541,7 @@ struct JpegEncOutputInfo {
 };
 
 struct PlayGoInitParams {
-    const void* buf_addr;
-    std::uint32_t buf_size;
+    const void* buf_addr;    std::uint32_t buf_size;
     std::uint32_t reserved;
 };
 
@@ -1561,6 +1560,11 @@ union PlayGoOptionalChunk {
     std::uint64_t bitmask;
     std::uint64_t languages;
     std::uint64_t scenarios;
+};
+
+struct PlayGoDialogResult {
+    std::int32_t result;
+    std::int32_t reserved[9];
 };
 
 using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);
