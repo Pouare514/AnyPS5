@@ -10,4 +10,21 @@ int APS5_VABI sceCoredumpWriteUserData() {
  return 0;
 }
 
+APS5_EXPORT("vNe1w4diLCs", sceKernelUnknown00);
+int APS5_VABI sceKernelUnknown00(void) {
+    NotImplemented_nid_no_patch("vNe1w4diLCs");
+    return 0;
+}
+
+APS5_EXPORT("teiItL2boFw", sceKernelUnknown01);
+int APS5_VABI sceKernelUnknown01(void) {
+    NotImplemented_nid_no_patch("teiItL2boFw");
+    return 0;
+}
+
+APS5_EXPORT("0D4-FVvEikw", sceKernelUnknown02);
+int APS5_VABI sceKernelUnknown02(void) {
+    NotImplemented_nid_no_patch("0D4-FVvEikw");
+    return 0;
+}
 }

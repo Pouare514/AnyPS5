@@ -709,4 +709,16 @@ int APS5_VABI sceSaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_
     return rc;
 }
 
+
+APS5_EXPORT("RjMlsR8EXrw", sceSaveDataUnknown00);
+int APS5_VABI sceSaveDataUnknown00(void) {
+    NotImplemented_nid_no_patch("RjMlsR8EXrw");
+    return 0;
+}
+
+APS5_EXPORT("X4MYzukPc3g", sceSaveDataUnknown01);
+int APS5_VABI sceSaveDataUnknown01(void) {
+    NotImplemented_nid_no_patch("X4MYzukPc3g");
+    return 0;
+}
 }

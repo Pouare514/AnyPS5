@@ -47,4 +47,10 @@ int APS5_VABI sceContentExportTerm(void) {
     return 0;
 }
 
+
+APS5_EXPORT("AOWqIYsgVHs", sceContentExportUnknown00);
+int APS5_VABI sceContentExportUnknown00(void) {
+    NotImplemented_nid_no_patch("AOWqIYsgVHs");
+    return 0;
+}
 }
