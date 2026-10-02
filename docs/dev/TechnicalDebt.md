@@ -66,6 +66,7 @@ Throughout the project, every function at every stage either **does exactly what
 - [teiItL2boFw](../../core/libs/prx/libkernel/Unimplemented.cpp) (libkernel) - unknown name, signature
 - [lbXTXRG5nyM](../../core/libs/prx/libSceNpSessionSignaling/Export.cpp) (libSceNpSessionSignaling) - unknown name, signature
 - [+Q++Q49a9z8](../../core/libs/prx/libSceNpSessionSignaling/Export.cpp) (libSceNpSessionSignaling) - unknown name, signature
+- TLOU Part I thread bootstrap reads a thread control block at its 1 GiB-aligned stack base plus 0x48 and dereferences it; entries derived from a singleton at image offset 0x44ae9f80. Host thread stacks do not provide that layout, so the bootstrap faults. Needs PS5 thread-stack ABI research before any game-specific workaround.
 
 ### Functional
 
