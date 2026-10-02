@@ -30,4 +30,10 @@ int APS5_VABI sceKernelAprResolveFilepathsWithPrefixToIdsForEach() {
  return 0;
 }
 
+APS5_EXPORT("teiItL2boFw", sceKernelUnknown00);
+int APS5_VABI sceKernelUnknown00() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 }
