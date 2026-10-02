@@ -48,6 +48,10 @@ Throughout the project, every function at every stage either **does exactly what
 - [MEJ7tc7ThwM](../../core/libs/prx/libkernel/System/src/Coredump.cpp) (libkernel) - unknown name, signature
 - [Uxqkdta7wEg](../../core/libs/prx/libkernel/System/src/Coredump.cpp) (libkernel) - unknown name, signature
 - [+YX0z-GUSNw](../../core/libs/prx/libkernel/System/src/Coredump.cpp) (libkernel) - unknown name, signature
+- [T4ucGB8CsnM](../../core/libs/prx/libSceVideoOut/src/Output.cpp) (libSceVideoOut) - unknown name, takes four opaque 64-bit arguments
+- [5tRaBjtdTzY](../../core/libs/prx/libSceVideoOut/src/Output.cpp) (libSceVideoOut) - unknown name, takes four opaque 64-bit arguments
+- [kP2L8t3j-aM](../../core/libs/prx/libSceVideoOut/src/Output.cpp) (libSceVideoOut) - unknown name, takes no arguments
+- [LibwuIonIBw](../../core/libs/prx/libSceVideoOut/src/Output.cpp) (libSceVideoOut) - unknown name, signature
 
 ### Functional
 
