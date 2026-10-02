@@ -1592,6 +1592,11 @@ union PlayGoOptionalChunk {
     std::uint64_t scenarios;
 };
 
+struct PlayGoDialogResult {
+    std::int32_t result;
+    std::int32_t reserved[9];
+};
+
 using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);
 
 struct SystemServiceStatus {
