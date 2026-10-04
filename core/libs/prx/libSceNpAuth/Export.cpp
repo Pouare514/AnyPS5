@@ -23,8 +23,7 @@ int APS5_VABI sceNpAuthCreateAsyncRequest(const void* param) {
 }
 
 int APS5_VABI sceNpAuthCreateRequest(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return g_nextRequest.fetch_add(1, std::memory_order_relaxed);
 }
 
 int APS5_VABI sceNpAuthDeleteRequest(int req_id) {
