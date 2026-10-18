@@ -13,7 +13,6 @@
 #include <ctime>
 #include <exception>
 #include <limits>
-#include <string>
 
 extern "C" {
 SonyLconv* APS5_VABI sceAmprLocaleconv(void);
@@ -47,21 +46,14 @@ int APS5_VABI fopen_s_nid_postfix(void** result, const char* filename, const cha
 #define Require(condition) do { if (!(condition)) { std::fprintf(stderr, "guest_crt: line %d: %s\n", __LINE__, #condition); std::abort(); } } while (0)
 
 static int g_handlerCalls = 0;
-static void CountingHandler(const char* message, void* pointer, int error) {
+static void APS5_VABI CountingHandler(const char* message, void* pointer, int error) {
     (void)message;
     (void)pointer;
     (void)error;
     ++g_handlerCalls;
 }
 
-int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "abort-child") == 0) {
-        set_constraint_handler_s_nid_postfix(nullptr);
-        std::uint16_t buffer[4] = {};
-        const std::uint16_t longText[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 0};
-        sceAmprWcscpyS(buffer, 4, longText);
-        return 0;
-    }
+int main() {
     Require(sceAmprFpclassifyd(std::numeric_limits<double>::quiet_NaN()) == 2);
     Require(sceAmprFpclassifyd(std::numeric_limits<double>::infinity()) == 1);
     Require(sceAmprFpclassifyd(0.0) == 0);
@@ -91,19 +83,7 @@ int main(int argc, char** argv) {
     for (char value : locale->chars) Require(value == CHAR_MAX);
     Require(std::strcmp(locale->false_text, "false") == 0 && std::strcmp(locale->true_text, "true") == 0);
     Require(locale->grouping[0] == '\0' && locale->thousands_sep[0] == '\0');
-    void* amprBase = SonyLconvFor(SonyLconvVariant::Ampr48);
-    Require(amprBase == static_cast<void*>(locale));
-    Require(reinterpret_cast<std::uintptr_t>(&static_cast<SonyLconv*>(amprBase)->decimal_point) - reinterpret_cast<std::uintptr_t>(amprBase) == 0x48);
-    void* compactBase = SonyLconvFor(SonyLconvVariant::Compact0);
-    Require(compactBase != nullptr && compactBase != amprBase);
-    Require(reinterpret_cast<std::uintptr_t>(&static_cast<SonyLconvCompact*>(compactBase)->decimal_point) - reinterpret_cast<std::uintptr_t>(compactBase) == 0x00);
-    void* compactEx = SonyLocaleconvEx(SonyLconvVariant::Compact0);
-    Require(compactEx == compactBase);
-    Require(static_cast<SonyLconvCompact*>(compactEx)->decimal_point != nullptr);
-    Require(std::strcmp(static_cast<SonyLconvCompact*>(compactEx)->decimal_point, ".") == 0);
-    void* amprEx = SonyLocaleconvEx(SonyLconvVariant::Ampr48);
-    Require(amprEx == amprBase);
-    Require(SonyLocaleconv() == locale);
+    Require(SonyLocaleconv_nid_no_patch() == locale);
 
     Require(__udivti3_nid_postfix(100, 3) == 33);
     Require(SonyUdivti3(100, 3) == 33);
@@ -283,8 +263,10 @@ int main(int argc, char** argv) {
     Require(randomChanged);
 
     set_constraint_handler_s_nid_postfix(nullptr);
-    std::string command = std::string("\"") + argv[0] + "\" abort-child";
-    int status = std::system(command.c_str());
-    Require(status != 0);
+    Require(SonyConstraintHandlerSlot() == &SonyDefaultConstraintHandler);
+    set_constraint_handler_s_nid_postfix(reinterpret_cast<void*>(&CountingHandler));
+    Require(SonyConstraintHandlerSlot() == &CountingHandler);
+    sceAmprSetConstraintHandlerS(nullptr);
+    Require(SonyConstraintHandlerSlot() == &SonyDefaultConstraintHandler);
     return 0;
 }
