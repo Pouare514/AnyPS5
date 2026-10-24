@@ -263,10 +263,13 @@ int main() {
     Require(randomChanged);
 
     set_constraint_handler_s_nid_postfix(nullptr);
-    Require(SonyConstraintHandlerSlot() == &SonyDefaultConstraintHandler);
-    set_constraint_handler_s_nid_postfix(reinterpret_cast<void*>(&CountingHandler));
-    Require(SonyConstraintHandlerSlot() == &CountingHandler);
-    sceAmprSetConstraintHandlerS(nullptr);
-    Require(SonyConstraintHandlerSlot() == &SonyDefaultConstraintHandler);
+    void* const defaultHandler = set_constraint_handler_s_nid_postfix(reinterpret_cast<void*>(&CountingHandler));
+    Require(defaultHandler != nullptr && defaultHandler != reinterpret_cast<void*>(&CountingHandler));
+    Require(reinterpret_cast<void*>(SonyConstraintHandlerSlot()) == reinterpret_cast<void*>(&CountingHandler));
+    Require(sceAmprSetConstraintHandlerS(nullptr) == reinterpret_cast<void*>(&CountingHandler));
+    Require(reinterpret_cast<void*>(SonyConstraintHandlerSlot()) == defaultHandler);
+    Require(set_constraint_handler_s_nid_postfix(reinterpret_cast<void*>(&CountingHandler)) == defaultHandler);
+    Require(set_constraint_handler_s_nid_postfix(nullptr) == reinterpret_cast<void*>(&CountingHandler));
+    Require(reinterpret_cast<void*>(SonyConstraintHandlerSlot()) == defaultHandler);
     return 0;
 }
