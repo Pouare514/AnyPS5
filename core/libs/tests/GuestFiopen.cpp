@@ -71,7 +71,6 @@ int main() {
     Write(Open(file, Out), "abc");
     Require(Contents(file) == "abc");
 
-    // fopen_s violations invoke the shared constraint handler (Annex K); ignore it and check the codes.
     set_constraint_handler_s_nid_postfix(reinterpret_cast<void*>(&ignore_handler_s_nid_postfix));
     FileStream* checkedStream = &_Stdout_nid_postfix;
     Require(fopen_s_nid_postfix(&checkedStream, nullptr, "rb") == GuestEinval);
